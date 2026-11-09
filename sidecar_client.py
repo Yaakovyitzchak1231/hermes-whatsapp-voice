@@ -49,6 +49,8 @@ SETTINGS: dict[str, Any] = {
     "voice_api_url": "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
     "answer_inbound": True,
     "send_summary": True,
+    "call_stats": True,
+    "pricing": {},
 }
 
 
@@ -62,6 +64,11 @@ def data_dir() -> Path:
     path = plugin_data_dir(PLUGIN_NAME)
     path.chmod(0o700)  # holds the WhatsApp session and the sidecar token
     return path
+
+
+def stats_path() -> Path:
+    """Per-call stats (tokens, estimated cost), one JSON line per call, written by the sidecar."""
+    return data_dir() / "call_stats.jsonl"
 
 
 def binary_path() -> Path:
@@ -177,6 +184,8 @@ def sidecar_env(ctx) -> dict[str, str]:
         "HWV_GEMINI_URL": str(s["voice_api_url"]),
         "HWV_ANSWER_INBOUND": "true" if s["answer_inbound"] else "false",
         "HWV_SEND_SUMMARY": "true" if s["send_summary"] else "false",
+        "HWV_CALL_STATS": "true" if s["call_stats"] else "false",
+        "HWV_PRICING": json.dumps(s["pricing"] or {}),
         "HWV_VOCABULARY": str(s["vocabulary"]),
         "HWV_CONTEXT_URL": f"http://{s['context_listen']}" if s["context_mode"] == "core_session" else "",
         "HWV_DATA_DIR": str(data_dir()),

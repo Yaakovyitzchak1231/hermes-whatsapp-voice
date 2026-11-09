@@ -52,6 +52,10 @@ pub struct Config {
     pub context_url: String,
     /// Words transcription should spell as given (names).
     pub vocabulary: Vec<String>,
+    /// Where each finished call's stats line (tokens, estimated cost) is appended; None turns it off.
+    pub stats_log: Option<PathBuf>,
+    /// Prices behind the per-call cost estimate.
+    pub pricing: crate::stats::Pricing,
 }
 
 pub(crate) fn list(raw: &str) -> Vec<String> {
@@ -163,6 +167,16 @@ impl Config {
             send_summary: var("HWV_SEND_SUMMARY", "true") == "true",
             context_url: var("HWV_CONTEXT_URL", "").trim_end_matches('/').to_string(),
             vocabulary: list(&var("HWV_VOCABULARY", "")),
+            stats_log: (var("HWV_CALL_STATS", "true") == "true")
+                .then(|| Self::data_dir().map(|d| d.join("call_stats.jsonl")))
+                .transpose()?,
+            // A bad price only skews estimates; it must never keep calls from working.
+            pricing: crate::stats::Pricing::from_json(&var("HWV_PRICING", "{}")).unwrap_or_else(
+                |e| {
+                    log::warn!("{e:#}; using the default prices for cost estimates");
+                    crate::stats::Pricing::default()
+                },
+            ),
         })
     }
 

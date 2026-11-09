@@ -94,7 +94,8 @@ before each release.
 </table>
 
 After each call you get a short summary on WhatsApp, and every call keeps a record with its
-transcript and timing (`hermes whatsapp-voice calls`).
+transcript and timing (`hermes whatsapp-voice calls`). `hermes whatsapp-voice stats` lists each
+call's length, Gemini tokens and estimated cost, with totals.
 
 ## Quick start
 
@@ -108,7 +109,7 @@ transcript and timing (`hermes whatsapp-voice calls`).
   `hermes model` (choose Gemini) adds it. Google login (Cloud Code OAuth) does not work for the
   Live API. The live models have a free tier, but Google may use free-tier data. On the paid tier a
   call costs roughly 3 to 5 cents a minute with the default settings (estimated from real calls; each
-  call's token use is in its `metrics`).
+  call's tokens and estimated cost are in `hermes whatsapp-voice stats`).
 - Optional, but needed for the voice agent to reach Hermes: the Hermes
   [API server](https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server) enabled.
   It must have an `API_SERVER_KEY`.
@@ -283,6 +284,9 @@ voice takes its name and personality from your own Hermes. Full reference:
   chat. It relies on Hermes internals listed in `CORE_PATCHES.md`.
 - **Recordings** (`record_calls`, off by default) save your side of each call as a WAV file in the
   plugin's private data folder. Nothing is uploaded; delete them any time.
+- **Call stats** (`call_stats`, on by default) append each call's length, token counts and
+  estimated cost to `call_stats.jsonl` in the same folder: numbers only, no transcript, reason or
+  audio.
 - **Secrets** are read through Hermes (`get_secret`) and passed to the sidecar in its environment.
   The plugin never reads `.env` itself. The sidecar's local API only binds to a loopback address.
 

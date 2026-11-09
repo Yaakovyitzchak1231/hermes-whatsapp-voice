@@ -122,6 +122,16 @@ config_schema:
     default: true
     label: "Send call summary"
     description: "Message a short WhatsApp summary after each call."
+  call_stats:
+    type: bool
+    default: true
+    label: "Log call stats"
+    description: "Append each call's duration, Gemini token counts and estimated cost to call_stats.jsonl in the plugin's data folder (no transcript or audio). See them with: hermes whatsapp-voice stats"
+  pricing:
+    type: dict
+    default: {}
+    label: "Cost estimate prices (USD)"
+    description: "Overrides for the per-call cost estimate. Keys (defaults): audio_input_per_mtok (3.0), audio_output_per_mtok (12.0), text_input_per_mtok (0.75), text_output_per_mtok (4.5) per million tokens; audio_input_per_min (0.005), audio_output_per_min (0.018) used only when the model reports no tokens. Estimates, not a bill."
   voice_tools:
     type: str
     default: "memory, session_search, skills_list, skill_view, web_search, web_extract, read_file, search_files, todo_list, hindsight_recall, hindsight_retain, hindsight_reflect"

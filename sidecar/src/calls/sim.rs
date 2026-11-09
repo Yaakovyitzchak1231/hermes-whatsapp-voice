@@ -410,6 +410,8 @@ fn test_config(gemini_url: &str, hermes_url: &str) -> Config {
         send_summary: true,
         context_url: String::new(),
         vocabulary: vec![],
+        stats_log: None,
+        pricing: Default::default(),
     }
 }
 
@@ -832,6 +834,74 @@ async fn records_the_owner_audio_when_enabled() {
     sim.finished(&id, task).await;
     let (rate, pcm) = read_wav(&dir.join(format!("{id}.wav"))).unwrap();
     assert_eq!((rate, pcm.len()), (16_000, 400 / 20 * 320));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn logs_each_calls_tokens_and_estimated_cost() {
+    let dir = std::env::temp_dir().join(format!("hwv-stats-{}", rand::random::<u32>()));
+    let path = dir.join("call_stats.jsonl");
+    let log = path.clone();
+    let mut sim = Sim::new(false, move |c| c.stats_log = Some(log)).await;
+    let (id, phone, task) = sim.call();
+    let mut m = sim.model.accept().await;
+    m.wait_text().await;
+    m.call_tool("t1", "ask_hermes", json!({"request": "weather?"}));
+    m.wait_tool_response("t1").await;
+    m.say("It's sunny.");
+    m.send(json!({"usageMetadata": {
+        "promptTokenCount": 300, "responseTokenCount": 40, "totalTokenCount": 340,
+        "promptTokensDetails": [{"modality": "AUDIO", "tokenCount": 250}, {"modality": "TEXT", "tokenCount": 50}],
+        "responseTokensDetails": [{"modality": "AUDIO", "tokenCount": 40}],
+    }}));
+    assert!(phone.hears_speech(WAIT).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    phone.hang_up();
+    let r = sim.finished(&id, task).await;
+    assert_eq!(r.metrics.ask_hermes_calls, 1);
+    assert_eq!(r.metrics.usage.prompt_tokens, 1300);
+    assert_eq!(r.metrics.usage.reports, 2);
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1, "one line per call");
+    let l = &lines[0];
+    assert_eq!(l["call_id"], id.as_str());
+    assert_eq!(l["direction"], "inbound");
+    assert_eq!(l["status"], "completed");
+    assert_eq!(l["ended_by"], "phone");
+    assert_eq!(l["voice_mode"], "separate");
+    assert_eq!(l["model"], "gemini-3.8-live");
+    assert_eq!(l["ask_hermes_calls"], 1);
+    assert_eq!(l["usage"]["prompt_tokens"], 1300);
+    assert_eq!(l["usage"]["response_tokens"], 90);
+    assert_eq!(l["usage"]["prompt_audio_tokens"], 250);
+    assert_eq!(l["cost_estimate"]["basis"], "tokens");
+    assert!(l["cost_estimate"]["usd"].as_f64().unwrap() > 0.0);
+    assert!(
+        !text.contains("sunny") && !text.contains("weather"),
+        "no call content"
+    );
+
+    // A call that never reaches the voice model is logged too, at no cost.
+    let sim = Sim::new(false, {
+        let log = path.clone();
+        move |c| {
+            c.stats_log = Some(log);
+            c.gemini_url = "ws://127.0.0.1:1".into();
+        }
+    })
+    .await;
+    let (id, _phone, task) = sim.call();
+    sim.finished(&id, task).await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert_eq!(last["call_id"], id.as_str());
+    assert_eq!(last["status"], "failed");
+    assert_eq!(last["ended_by"], "error");
     std::fs::remove_dir_all(dir).unwrap();
 }
 

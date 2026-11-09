@@ -34,7 +34,9 @@ Restart the sidecar after a change: the dashboard's **Restart sidecar** button, 
 | `max_silent_tools` | `5` | Tools the voice may run in a row before it must tell you what it is doing |
 | `record_calls` | `false` | Save your side of each call as `recordings/<call id>.wav` in the plugin's data folder (this machine only) |
 | `answer_inbound` | `true` | Answer calls from `owner_number` |
-| `send_summary` | `true` | Message a summary after each call |
+| `send_summary` | `true` | Message a summary after each call (with its length, the voice model's tokens and an estimated cost) |
+| `call_stats` | `true` | Append each call's stats (duration, Gemini tokens, estimated cost; no transcript or audio) to `call_stats.jsonl` in the plugin's data folder. Review with `hermes whatsapp-voice stats` |
+| `pricing` | `{}` | Prices behind the cost estimate, merged over the defaults (see [Call stats and cost](#call-stats-and-cost)) |
 | `listen` | `127.0.0.1:8796` | Sidecar API address (loopback) |
 | `context_listen` | `127.0.0.1:8797` | `core_session` service address (loopback) |
 | `voice_api_url` | Gemini Live endpoint | Advanced: the Live API WebSocket URL, for a proxy. The Gemini key is sent there |
@@ -105,11 +107,62 @@ session with Hermes:
 
 **Cost:** a live voice model re-reads its whole context on every reply. In this mode that context is
 the chat's system prompt, tool schemas and up to `history_chars` of history, so a call costs several
-times more than with `separate`. Each call record shows the tokens the voice model used (`usage`).
+times more than with `separate`. Each call record shows the tokens the voice model used (`metrics.usage`),
+and `hermes whatsapp-voice stats` shows them with an estimated cost per call.
 
 It uses Hermes internals that are not part of the plugin API (listed in `CORE_PATCHES.md`); if the
 service is unavailable, a call falls back to the separate voice agent. It needs a WhatsApp DM
 session with the bot to exist (send it one text first).
+
+## Call stats and cost
+
+After each call the sidecar appends one JSON line to `call_stats.jsonl` in the plugin's data folder
+(`call_stats: false` turns it off): call id, direction, status, start/answer/end times, seconds on
+the line, who ended it, the model, the voice mode, tool and `ask_hermes` counts, the voice model's
+token use and an estimated cost. It never holds the transcript, the call reason, audio or keys.
+
+```bash
+hermes whatsapp-voice stats             # last 10 calls, plus totals over all logged calls
+hermes whatsapp-voice stats --limit 50
+hermes whatsapp-voice stats --json      # the raw records
+```
+
+**Tokens** come from the `usageMetadata` Gemini Live sends with each model response, summed over the
+call: `prompt_tokens`, `response_tokens`, `total_tokens`, cached / tool-use / thinking tokens, and the
+audio/text split when Gemini reports it. Each response counts the whole context the model re-read,
+which is what Google bills, so the sum is the call's billed total.
+
+**Cost** is an estimate, never a bill. With token data it is priced per modality; without any (the
+model reported nothing) it falls back to a per-minute rate over the answered time. Defaults, in USD,
+are Google's published paid-tier prices for `gemini-3.8-live`
+([pricing page](https://ai.google.dev/gemini-api/docs/pricing); 25 audio tokens a second, so ~$0.005/min in and ~$0.018/min
+out, about 2.3 cents a call minute before text):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `audio_input_per_mtok` | `3.0` | Audio in, per million tokens |
+| `audio_output_per_mtok` | `12.0` | Audio out, per million tokens |
+| `text_input_per_mtok` | `0.75` | Text in (prompt, history, tool results), per million tokens |
+| `text_output_per_mtok` | `4.5` | Text out and thinking, per million tokens |
+| `audio_input_per_min` | `0.005` | Fallback only: per answered minute, in |
+| `audio_output_per_min` | `0.018` | Fallback only: per answered minute, out |
+
+Tokens Gemini does not label with a modality are priced as audio and cached tokens at the full input
+rate, so the estimate errs high. Change a price when Google's changes, for example:
+
+```yaml
+# ~/.hermes/config.yaml
+plugins:
+  entries:
+    hermes-whatsapp-voice:
+      settings:
+        pricing: {audio_output_per_mtok: 12.5}
+```
+
+Prices apply to calls logged after the sidecar restarts; earlier lines keep the prices they were
+logged with (each line stores them).
+
+The post-call WhatsApp message shows it too: `📞 Call summary (3 min · 41.2k tokens · ~$0.12 est.)`.
 
 ## Credentials
 

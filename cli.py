@@ -1,4 +1,4 @@
-"""`hermes whatsapp-voice ...` subcommands: install, pair, serve, service, status, call."""
+"""`hermes whatsapp-voice ...` subcommands: install, pair, serve, service, status, call, calls, stats."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .sidecar_client import (
@@ -20,6 +21,7 @@ from .sidecar_client import (
     gemini_key,
     settings,
     sidecar_env,
+    stats_path,
 )
 
 PLUGIN_DIR = Path(__file__).resolve().parent
@@ -169,6 +171,91 @@ def _calls(ctx, limit: int) -> None:
         raise SystemExit(str(e)) from e
 
 
+def load_stats(path: Path) -> tuple[list[dict], int]:
+    """Call stats lines, oldest first, and how many lines could not be read."""
+    if not path.exists():
+        return [], 0
+    records, bad = [], 0
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+        else:
+            bad += 1
+    return records, bad
+
+
+def _duration(seconds: int) -> str:
+    seconds = int(seconds or 0)
+    if seconds >= 3600:
+        return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+    return f"{seconds // 60}m{seconds % 60:02d}s"
+
+
+def _tokens(n: int) -> str:
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1e6:.2f}M"
+    if n >= 1000:
+        return f"{n / 1e3:.1f}k"
+    return str(n)
+
+
+def _usd(record: dict) -> float:
+    return float((record.get("cost_estimate") or {}).get("usd") or 0.0)
+
+
+def format_stats(records: list[dict], limit: int, bad: int = 0) -> str:
+    """Recent calls (newest first) and totals over every logged call. Costs are estimates."""
+    if not records:
+        return "No call stats yet. They are logged after each call (setting call_stats)."
+    rows = [f"{'when':<16}  {'dir':<8}  {'length':>7}  {'tokens':>7}  {'est. cost':>9}  {'basis':<7}  ended by"]
+    for r in list(reversed(records))[: max(limit, 0)]:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(r.get("started_at") or 0)))
+        usage = r.get("usage") or {}
+        basis = (r.get("cost_estimate") or {}).get("basis", "?")
+        rows.append(
+            f"{when:<16}  {r.get('direction', '?')!s:<8}  {_duration(r.get('duration_seconds')):>7}  "
+            f"{_tokens(usage.get('total_tokens')):>7}  {'$' + format(_usd(r), '.3f'):>9}  {basis:<7}  "
+            f"{r.get('ended_by') or r.get('status') or '?'}"
+        )
+    seconds = sum(int(r.get("duration_seconds") or 0) for r in records)
+    usage = [r.get("usage") or {} for r in records]
+    total = sum(int(u.get("total_tokens") or 0) for u in usage)
+    prompt = sum(int(u.get("prompt_tokens") or 0) for u in usage)
+    response = sum(int(u.get("response_tokens") or 0) for u in usage)
+    cost = sum(_usd(r) for r in records)
+    answered = [r for r in records if int(r.get("duration_seconds") or 0) > 0]
+    per_min = cost / (seconds / 60) if seconds else 0.0
+    rows += [
+        "",
+        f"Totals, {len(records)} calls ({len(answered)} answered): {_duration(seconds)} on the line, "
+        f"{_tokens(total)} tokens (in {_tokens(prompt)} / out {_tokens(response)}), est. ${cost:.2f}"
+        + (f" (~${per_min:.3f}/min)" if seconds else ""),
+        "Costs are estimates from Gemini's reported token counts and the `pricing` setting, not a bill.",
+    ]
+    if bad:
+        rows.append(f"({bad} unreadable line(s) skipped)")
+    return "\n".join(rows)
+
+
+def _stats(limit: int, as_json: bool) -> None:
+    path = stats_path()
+    records, bad = load_stats(path)
+    if as_json:
+        print(json.dumps(list(reversed(records))[: max(limit, 0)], indent=2))
+        return
+    print(format_stats(records, limit, bad))
+    if records:
+        print(f"Log: {path}")
+
+
 def setup_parser(subparser) -> None:
     subs = subparser.add_subparsers(dest="wv_command")
     install = subs.add_parser("install", help="Install the sidecar binary (release download, or build with Rust)")
@@ -182,6 +269,9 @@ def setup_parser(subparser) -> None:
     call.add_argument("reason", nargs="?", default="This is a quick test call.")
     calls = subs.add_parser("calls", help="Show recent calls: transcript, end reason and timing metrics")
     calls.add_argument("--limit", type=int, default=5)
+    stats = subs.add_parser("stats", help="Show per-call duration, Gemini tokens and estimated cost, with totals")
+    stats.add_argument("--limit", type=int, default=10, help="How many recent calls to list")
+    stats.add_argument("--json", action="store_true", help="Print the recent calls' raw stats records")
 
 
 def make_handler(ctx):
@@ -201,7 +291,9 @@ def make_handler(ctx):
             _call(ctx, args.reason)
         elif cmd == "calls":
             _calls(ctx, args.limit)
+        elif cmd == "stats":
+            _stats(args.limit, args.json)
         else:
-            print("Usage: hermes whatsapp-voice {install,pair,serve,service,status,call,calls}", file=sys.stderr)
+            print("Usage: hermes whatsapp-voice {install,pair,serve,service,status,call,calls,stats}", file=sys.stderr)
 
     return handle

@@ -21,6 +21,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::audio::{i16_to_le_bytes, le_bytes_to_i16};
+use crate::stats::Usage;
 
 pub const ENDPOINT: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 const MAX_RECONNECTS: u32 = 3;
@@ -134,11 +135,8 @@ pub enum LiveEvent {
     ToolCancelled(Vec<String>),
     /// The model finished its turn.
     TurnComplete,
-    /// Tokens billed for one model response.
-    Usage {
-        prompt: u64,
-        response: u64,
-    },
+    /// Tokens billed for one model response (`usageMetadata`).
+    Usage(Usage),
     /// The session ended for good; carries the reason.
     Closed(String),
 }
@@ -218,10 +216,7 @@ fn parse_server_message(msg: &Value) -> Parsed {
     }
     p.go_away = msg.get("goAway").map(|g| parse_time_left(&g["timeLeft"]));
     if let Some(u) = msg.get("usageMetadata") {
-        p.events.push(LiveEvent::Usage {
-            prompt: u["promptTokenCount"].as_u64().unwrap_or(0),
-            response: u["responseTokenCount"].as_u64().unwrap_or(0),
-        });
+        p.events.push(LiveEvent::Usage(Usage::from_metadata(u)));
     }
     p
 }
@@ -536,10 +531,13 @@ mod tests {
         let msg = json!({"usageMetadata": {"promptTokenCount": 1200, "responseTokenCount": 80, "totalTokenCount": 1280}});
         assert_eq!(
             parse_server_message(&msg).events,
-            vec![LiveEvent::Usage {
-                prompt: 1200,
-                response: 80
-            }]
+            vec![LiveEvent::Usage(Usage {
+                prompt_tokens: 1200,
+                response_tokens: 80,
+                total_tokens: 1280,
+                reports: 1,
+                ..Usage::default()
+            })]
         );
     }
 

@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::core::{self, Core};
 use crate::gemini::{Live, LiveEvent, Setup};
 use crate::hermes::Hermes;
+use crate::stats::{self, CallStats, StatsLog, Usage};
 
 const KEEP_RECORDS: usize = 50;
 const FRAME_INTERVAL: Duration = Duration::from_millis(60);
@@ -141,6 +142,12 @@ pub struct Metrics {
     /// Tokens the voice model billed for the call, summed over its responses.
     pub prompt_tokens: u64,
     pub response_tokens: u64,
+    /// The full `usageMetadata` sum: totals plus the audio/text split.
+    pub usage: Usage,
+    /// ask_hermes runs the model started (separate-agent mode).
+    pub ask_hermes_calls: u32,
+    /// How the voice ran: core_session or separate (empty if it never connected).
+    pub voice_mode: &'static str,
 }
 
 /// Fills `Metrics` from the call's events as they happen.
@@ -254,6 +261,8 @@ impl CallRecord {
 pub struct Calls {
     records: Mutex<VecDeque<CallRecord>>,
     active: Mutex<Option<String>>,
+    /// Where finished calls' stats go; None in most tests.
+    stats: Option<StatsLog>,
 }
 
 impl Calls {
@@ -282,6 +291,31 @@ impl Calls {
         let mut active = self.active.lock().unwrap();
         if active.as_deref() == Some(id) {
             *active = None;
+        }
+        drop(active);
+        self.log_stats(id);
+    }
+
+    /// Appends the finished call's stats line; a failure only costs the line, never the call.
+    fn log_stats(&self, id: &str) {
+        let (Some(log), Some(r)) = (&self.stats, self.get(id)) else {
+            return;
+        };
+        let line = CallStats {
+            id: &r.id,
+            direction: r.direction,
+            status: serde_json::to_value(r.status).unwrap_or_default(),
+            started_at: r.started_at,
+            answered_at: r.answered_at,
+            ended_at: r.ended_at,
+            ended_by: r.metrics.ended_by,
+            voice_mode: r.metrics.voice_mode,
+            tool_calls: r.metrics.tool_calls,
+            ask_hermes_calls: r.metrics.ask_hermes_calls,
+            usage: &r.metrics.usage,
+        };
+        if let Err(e) = log.append(&line) {
+            log::warn!("call {id}: could not write call stats: {e}");
         }
     }
 
@@ -469,10 +503,18 @@ impl Bridge {
     pub fn new(cfg: Config, client: Option<Arc<Client>>) -> Self {
         let hermes = (!cfg.hermes_api_key.is_empty())
             .then(|| Hermes::new(&cfg.hermes_api_url, &cfg.hermes_api_key));
+        let calls = Calls {
+            stats: cfg.stats_log.clone().map(|path| StatsLog {
+                path,
+                model: cfg.model.clone(),
+                pricing: cfg.pricing.clone(),
+            }),
+            ..Calls::default()
+        };
         Self {
             cfg,
             client,
-            calls: Calls::default(),
+            calls,
             hermes,
             ring_signals: RingSignals::default(),
             persona: Mutex::default(),
@@ -903,6 +945,11 @@ impl Bridge {
         let mut ending = Ending::new(self.cfg.silence_timeout, self.cfg.hangup_grace);
         let mut pacing = Pacing::new(self.cfg.max_silent_tools);
         let mut timeline = Timeline::new(connecting);
+        timeline.m.voice_mode = if core.is_some() {
+            "core_session"
+        } else {
+            "separate"
+        };
         let mut recorder = self.cfg.recordings.as_ref().and_then(|dir| {
             std::fs::create_dir_all(dir)
                 .and_then(|_| WavWriter::create(&dir.join(format!("{id}.wav")), 16_000))
@@ -984,13 +1031,15 @@ impl Bridge {
                         self.calls.update(id, |r| r.append("assistant", &t));
                     }
                     Some(LiveEvent::TurnComplete) => emit(json!({"type": "turn_complete"})),
-                    Some(LiveEvent::Usage { prompt, response }) => {
-                        timeline.m.prompt_tokens += prompt;
-                        timeline.m.response_tokens += response;
+                    Some(LiveEvent::Usage(usage)) => {
+                        timeline.m.prompt_tokens += usage.prompt_tokens;
+                        timeline.m.response_tokens += usage.response_tokens;
+                        timeline.m.usage.add(&usage);
                     }
                     Some(LiveEvent::ToolCall { id: tool_id, name, args }) => match name.as_str() {
                         "ask_hermes" if core.is_none() => {
                             timeline.tool();
+                            timeline.m.ask_hermes_calls += 1;
                             log::info!("call {id}: ask_hermes {}", args["request"]);
                             let task = self.spawn_ask_hermes(&tool_id, id, &args, tool_tx.clone());
                             tool_tasks.insert(tool_id, task);
@@ -1088,13 +1137,23 @@ impl Bridge {
         if !self.cfg.send_summary || record.transcript.is_empty() {
             return;
         }
-        let minutes = record
+        let text = format!(
+            "📞 Call ended ({}). It's saved in this chat.",
+            self.usage_note(&record)
+        );
+        self.message_owner(id, text).await;
+    }
+
+    /// "3 min · 41.2k tokens · ~$0.12 est.": duration, the voice model's tokens and estimated cost.
+    fn usage_note(&self, record: &CallRecord) -> String {
+        let seconds = record
             .answered_at
             .zip(record.ended_at)
-            .map(|(a, e)| e.saturating_sub(a).div_ceil(60))
+            .map(|(a, e)| e.saturating_sub(a))
             .unwrap_or(0);
-        let text = format!("📞 Call ended ({minutes} min). It's saved in this chat.");
-        self.message_owner(id, text).await;
+        let usage = &record.metrics.usage;
+        let cost = stats::estimate(usage, seconds, &self.cfg.pricing);
+        stats::summary_note(seconds.div_ceil(60), usage, &cost)
     }
 
     async fn message_owner(&self, id: &str, text: String) {
@@ -1147,13 +1206,9 @@ impl Bridge {
         if !self.cfg.send_summary {
             return;
         }
-        let minutes = record
-            .answered_at
-            .zip(record.ended_at)
-            .map(|(a, e)| e.saturating_sub(a).div_ceil(60))
-            .unwrap_or(0);
         let text = format!(
-            "📞 Call summary ({minutes} min):\n{}",
+            "📞 Call summary ({}):\n{}",
+            self.usage_note(&record),
             truncate(&summary, 3500)
         );
         self.message_owner(id, text).await;

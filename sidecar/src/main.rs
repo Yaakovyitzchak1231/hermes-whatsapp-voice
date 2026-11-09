@@ -12,6 +12,7 @@ mod core;
 mod gemini;
 mod hermes;
 mod server;
+mod stats;
 
 use std::sync::Arc;
 use std::time::Duration;
