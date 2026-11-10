@@ -31,7 +31,7 @@ def test_registers_declared_tools_and_cli(plugin):
     # Unconfigured: tools stay hidden from the model.
     assert ctx.tools["whatsapp_call_owner"]["check_fn"]() is False
     # The call tool can only ever reach the owner.
-    assert set(ctx.tools["whatsapp_call_owner"]["schema"]["parameters"]["properties"]) == {"reason", "details"}
+    assert set(ctx.tools["whatsapp_call_owner"]["schema"]["parameters"]["properties"]) == {"reason", "details", "video"}
 
 
 def test_answered_call(plugin, no_sleep):

@@ -410,6 +410,8 @@ fn test_config(gemini_url: &str, hermes_url: &str) -> Config {
         send_summary: true,
         context_url: String::new(),
         vocabulary: vec![],
+        avatar: None,
+        video_calls: false,
     }
 }
 
@@ -450,7 +452,14 @@ impl Sim {
         let (bridge, id) = (self.bridge.clone(), record.id.clone());
         let task = tokio::spawn(async move {
             bridge
-                .converse(&id, &line, mic_tx, spk_rx, CallInfo::inbound())
+                .converse(
+                    &id,
+                    &line,
+                    mic_tx,
+                    spk_rx,
+                    CallInfo::inbound(),
+                    tokio::sync::mpsc::unbounded_channel().1,
+                )
                 .await;
         });
         (record.id, phone, task)

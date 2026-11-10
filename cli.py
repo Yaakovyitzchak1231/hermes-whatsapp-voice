@@ -155,11 +155,23 @@ def _status(ctx) -> None:
         raise SystemExit(str(e)) from e
 
 
-def _call(ctx, reason: str) -> None:
+def _call(ctx, reason: str, video: bool | None = None) -> None:
     try:
-        print(json.dumps(Client.from_ctx(ctx).start_call(reason), indent=2))
+        print(json.dumps(Client.from_ctx(ctx).start_call(reason, video=video), indent=2))
     except SidecarError as e:
         raise SystemExit(str(e)) from e
+
+
+def _avatar_setup() -> None:
+    """A private venv for the avatar bridge, so its packages never touch Hermes's own."""
+    venv = data_dir() / "avatar-venv"
+    requirements = PLUGIN_DIR / "sidecar" / "bridge" / "requirements.txt"
+    if not (venv / "bin" / "python").exists():
+        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+    subprocess.run(
+        [str(venv / "bin" / "python"), "-m", "pip", "install", "--quiet", "-r", str(requirements)], check=True
+    )
+    print(f"Avatar packages installed in {venv}. Set video_avatar to simli and restart the sidecar.")
 
 
 def _calls(ctx, limit: int) -> None:
@@ -180,6 +192,10 @@ def setup_parser(subparser) -> None:
     subs.add_parser("status", help="Show sidecar health")
     call = subs.add_parser("call", help="Place a test call to the owner")
     call.add_argument("reason", nargs="?", default="This is a quick test call.")
+    kind = call.add_mutually_exclusive_group()
+    kind.add_argument("--video", dest="video", action="store_true", default=None, help="Video call with the avatar")
+    kind.add_argument("--voice", dest="video", action="store_false", help="Voice-only call")
+    subs.add_parser("avatar-setup", help="Install the Python packages the video avatar (Simli) needs")
     calls = subs.add_parser("calls", help="Show recent calls: transcript, end reason and timing metrics")
     calls.add_argument("--limit", type=int, default=5)
 
@@ -198,10 +214,15 @@ def make_handler(ctx):
         elif cmd == "status":
             _status(ctx)
         elif cmd == "call":
-            _call(ctx, args.reason)
+            _call(ctx, args.reason, args.video)
+        elif cmd == "avatar-setup":
+            _avatar_setup()
         elif cmd == "calls":
             _calls(ctx, args.limit)
         else:
-            print("Usage: hermes whatsapp-voice {install,pair,serve,service,status,call,calls}", file=sys.stderr)
+            print(
+                "Usage: hermes whatsapp-voice {install,pair,serve,service,status,call,calls,avatar-setup}",
+                file=sys.stderr,
+            )
 
     return handle

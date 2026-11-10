@@ -291,7 +291,7 @@ voice takes its name and personality from your own Hermes. Full reference:
 - WhatsApp calling here uses an **unofficial**, reverse-engineered protocol (via whatsapp-rust).
   WhatsApp updates can break it, and automated use may violate WhatsApp's Terms of Service. Use a
   number you can afford to lose.
-- One call at a time. Group calls and video are not supported.
+- One call at a time. Group calls are not supported. Video calls need the Simli avatar (`video_avatar: simli`, see `sidecar/bridge/README.md`).
 - A Gemini Live connection lasts about 10 minutes. The sidecar resumes the session transparently, but
   a resume can fail and end a long call.
 

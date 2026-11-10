@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::avatar::AvatarConfig;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Owner's phone number, digits only.
@@ -52,6 +54,11 @@ pub struct Config {
     pub context_url: String,
     /// Words transcription should spell as given (names).
     pub vocabulary: Vec<String>,
+    /// The face for video calls (a Simli avatar); None leaves every call voice-only.
+    pub avatar: Option<AvatarConfig>,
+    /// Calls Hermes places are video calls when the face is set up (a call can still ask for
+    /// voice only).
+    pub video_calls: bool,
 }
 
 pub(crate) fn list(raw: &str) -> Vec<String> {
@@ -105,6 +112,22 @@ fn live_config(raw: &str) -> Result<serde_json::Value> {
     Ok(value)
 }
 
+/// The Simli bridge settings, when video calls are on.
+fn avatar_config(max_call: Duration, ring: Duration) -> Result<Option<AvatarConfig>> {
+    match var("HWV_VIDEO_AVATAR", "off").as_str() {
+        "off" => Ok(None),
+        "simli" => Ok(Some(AvatarConfig {
+            python: var("HWV_AVATAR_PYTHON", "python3"),
+            script: PathBuf::from(required("HWV_AVATAR_SCRIPT")?),
+            face_id: required("HWV_SIMLI_FACE_ID")?,
+            api_key: required("SIMLI_API_KEY")?,
+            // The session starts at dialing, so it must outlast the ring and the longest call.
+            max_session: max_call + ring + Duration::from_secs(60),
+        })),
+        other => bail!("HWV_VIDEO_AVATAR must be off or simli, got {other:?}"),
+    }
+}
+
 pub fn digits(number: &str) -> String {
     number.chars().filter(char::is_ascii_digit).collect()
 }
@@ -128,6 +151,8 @@ impl Config {
         if owner.len() < 7 {
             bail!("HWV_OWNER must be a full international phone number");
         }
+        let ring_timeout = parse_duration(&var("HWV_RING_TIMEOUT", "45s"))?;
+        let max_duration = parse_duration(&var("HWV_MAX_DURATION", "15m"))?;
         Ok(Self {
             owner,
             listen,
@@ -149,8 +174,8 @@ impl Config {
                 .to_string(),
             hermes_api_key: var("HERMES_API_KEY", ""),
             hermes_timeout: parse_duration(&var("HWV_HERMES_TIMEOUT", "180s"))?,
-            ring_timeout: parse_duration(&var("HWV_RING_TIMEOUT", "45s"))?,
-            max_duration: parse_duration(&var("HWV_MAX_DURATION", "15m"))?,
+            ring_timeout,
+            max_duration,
             silence_timeout: parse_duration(&var("HWV_SILENCE_TIMEOUT", "180s"))?,
             hangup_grace: parse_duration(&var("HWV_HANGUP_GRACE", "3s"))?,
             max_silent_tools: var("HWV_MAX_SILENT_TOOLS", "5")
@@ -163,6 +188,8 @@ impl Config {
             send_summary: var("HWV_SEND_SUMMARY", "true") == "true",
             context_url: var("HWV_CONTEXT_URL", "").trim_end_matches('/').to_string(),
             vocabulary: list(&var("HWV_VOCABULARY", "")),
+            avatar: avatar_config(max_duration, ring_timeout)?,
+            video_calls: var("HWV_VIDEO_CALLS", "true") == "true",
         })
     }
 

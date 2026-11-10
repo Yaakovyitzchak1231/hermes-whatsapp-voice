@@ -29,6 +29,10 @@ CALL_OWNER = {
                 "type": "string",
                 "description": "Optional background the voice agent should know during the call (task details, deadlines, options).",
             },
+            "video": {
+                "type": "boolean",
+                "description": "Video call with the live avatar (true) or voice only (false). Leave it out to use the owner's default.",
+            },
         },
         "required": ["reason"],
     },
@@ -67,7 +71,10 @@ def make_handlers(ctx):
             return _result(error="reason is required")
         try:
             client = Client.from_ctx(ctx)
-            call = client.start_call(reason, (args.get("details") or "").strip())
+            video = args.get("video")
+            call = client.start_call(
+                reason, (args.get("details") or "").strip(), video if isinstance(video, bool) else None
+            )
             deadline = time.monotonic() + int(settings(ctx)["ring_timeout_seconds"]) + 20
             while call.get("status") not in _SETTLED and time.monotonic() < deadline:
                 time.sleep(1)

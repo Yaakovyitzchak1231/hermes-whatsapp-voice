@@ -13,10 +13,11 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use whatsapp_rust::async_channel;
 use whatsapp_rust::prelude::*;
-use whatsapp_rust::voip::{CallHandle, CallTermination};
-use whatsapp_rust::wacore::types::call::IncomingCall;
+use whatsapp_rust::voip::{CallEvent, CallHandle, CallTermination};
+use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall};
 
 use crate::audio::{Downsampler, Playout, WavWriter};
+use crate::avatar::{Avatar, AvatarEvent, AvatarVideo, discard_peer_video};
 use crate::config::Config;
 use crate::core::{self, Core};
 use crate::gemini::{Live, LiveEvent, Setup};
@@ -569,7 +570,25 @@ impl Bridge {
         self.calls.begin("outbound", reason)
     }
 
-    pub async fn run_outbound(self: Arc<Self>, id: String, reason: String, details: String) {
+    /// Starts the face for a video call, or says why the call stays voice-only.
+    fn start_avatar(&self, id: &str) -> Option<(Avatar, AvatarVideo)> {
+        let cfg = self.cfg.avatar.as_ref()?;
+        match Avatar::spawn(cfg) {
+            Ok(face) => Some(face),
+            Err(e) => {
+                log::warn!("call {id}: no video, the avatar did not start: {e:#}");
+                None
+            }
+        }
+    }
+
+    pub async fn run_outbound(
+        self: Arc<Self>,
+        id: String,
+        reason: String,
+        details: String,
+        video: bool,
+    ) {
         let Some(client) = self.client.clone() else {
             return self
                 .calls
@@ -577,13 +596,16 @@ impl Bridge {
         };
         let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(8);
         let (spk_tx, spk_rx) = async_channel::bounded::<Vec<i16>>(64);
+        // The face starts while the phone rings: Simli takes several seconds to come up.
+        let face = if video { self.start_avatar(&id) } else { None };
         self.ring_signals.start();
-        let started = client
-            .voip()
-            .call(&self.owner_jid())
-            .audio(mic_rx, spk_tx)
-            .start()
-            .await;
+        let mut call = client.voip().call(&self.owner_jid()).audio(mic_rx, spk_tx);
+        let mut avatar = None;
+        if let Some((face, picture)) = face {
+            call = call.video(picture, discard_peer_video());
+            avatar = Some(face);
+        }
+        let started = call.start().await;
         let answered = match &started {
             Ok(handle) => {
                 log::info!(
@@ -600,10 +622,70 @@ impl Bridge {
         };
         self.ring_signals.stop();
         let (Ok(handle), true) = (started, answered) else {
+            if let Some(face) = avatar {
+                face.finish().await;
+            }
             return;
         };
         let info = CallInfo::outbound(reason, details);
-        self.converse(&id, &handle, mic_tx, spk_rx, info).await;
+        let (faces_tx, faces_rx) = mpsc::unbounded_channel();
+        let had_face = avatar.is_some();
+        if let Some(face) = avatar {
+            log::info!("call {id}: video call with the avatar");
+            let _ = faces_tx.send(face);
+        }
+        let upgrades = self.answer_video_upgrades(&id, &handle, faces_tx, had_face);
+        self.converse(&id, &handle, mic_tx, spk_rx, info, faces_rx)
+            .await;
+        upgrades.abort();
+    }
+
+    /// The owner turned their camera on during a voice call: answer with the face too.
+    fn answer_video_upgrades(
+        self: &Arc<Self>,
+        id: &str,
+        handle: &CallHandle,
+        faces: mpsc::UnboundedSender<Avatar>,
+        mut has_face: bool,
+    ) -> JoinHandle<()> {
+        let (bridge, handle, id) = (self.clone(), handle.clone(), id.to_string());
+        tokio::spawn(async move {
+            let Some(mut events) = handle.take_events() else {
+                return;
+            };
+            while let Ok(event) = events.recv().await {
+                let CallEvent::PeerVideoStateChanged {
+                    state,
+                    upgrade_token: Some(token),
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                if has_face || !state.is_upgrade_request() {
+                    continue;
+                }
+                let Some((face, picture)) = bridge.start_avatar(&id) else {
+                    continue;
+                };
+                match handle
+                    .accept_video(token, picture, discard_peer_video())
+                    .await
+                {
+                    Ok(()) => {
+                        log::info!("call {id}: owner switched to video; the avatar joined");
+                        has_face = true;
+                        if faces.send(face).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("call {id}: could not switch to video: {e}");
+                        face.finish().await;
+                    }
+                }
+            }
+        })
     }
 
     pub async fn run_inbound(self: Arc<Self>, call: IncomingCall) {
@@ -616,15 +698,24 @@ impl Bridge {
         };
         let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(8);
         let (spk_tx, spk_rx) = async_channel::bounded::<Vec<i16>>(64);
-        let handle = match client
-            .voip()
-            .accept(&call)
-            .audio(mic_rx, spk_tx)
-            .start()
-            .await
-        {
+        let video = matches!(call.action, CallAction::Offer { is_video: true, .. });
+        let face = if video {
+            self.start_avatar(&record.id)
+        } else {
+            None
+        };
+        let mut answer = client.voip().accept(&call).audio(mic_rx, spk_tx);
+        let mut avatar = None;
+        if let Some((face, picture)) = face {
+            answer = answer.video(picture, discard_peer_video());
+            avatar = Some(face);
+        }
+        let handle = match answer.start().await {
             Ok(h) => h,
             Err(e) => {
+                if let Some(face) = avatar {
+                    face.finish().await;
+                }
                 return self.calls.finish(
                     &record.id,
                     Status::Failed,
@@ -633,12 +724,27 @@ impl Bridge {
             }
         };
         log::info!(
-            "call {}: answered owner (whatsapp call {})",
+            "call {}: answered owner (whatsapp call {}){}",
             record.id,
-            handle.call_id()
+            handle.call_id(),
+            if avatar.is_some() { " with video" } else { "" }
         );
-        self.converse(&record.id, &handle, mic_tx, spk_rx, CallInfo::inbound())
-            .await;
+        let (faces_tx, faces_rx) = mpsc::unbounded_channel();
+        let had_face = avatar.is_some();
+        if let Some(face) = avatar {
+            let _ = faces_tx.send(face);
+        }
+        let upgrades = self.answer_video_upgrades(&record.id, &handle, faces_tx, had_face);
+        self.converse(
+            &record.id,
+            &handle,
+            mic_tx,
+            spk_rx,
+            CallInfo::inbound(),
+            faces_rx,
+        )
+        .await;
+        upgrades.abort();
     }
 
     /// Asks Hermes for a short briefing so the voice model shares its name, persona and memory.
@@ -831,6 +937,7 @@ impl Bridge {
         mic_tx: async_channel::Sender<Vec<i16>>,
         spk_rx: async_channel::Receiver<Vec<i16>>,
         info: CallInfo,
+        mut faces: mpsc::UnboundedReceiver<Avatar>,
     ) {
         self.calls.update(id, |r| {
             r.status = Status::InProgress;
@@ -914,6 +1021,9 @@ impl Bridge {
         if core.is_some() {
             *self.texts.lock().unwrap() = Some(text_tx);
         }
+        // Video calls: the face says the model's speech, and the call plays the face's copy so the
+        // lips match. Until the face is live (or if it fails), the plain voice plays.
+        let mut avatar: Option<Avatar> = None;
         let mut check = tokio::time::interval(Duration::from_millis(200));
         let max_duration = tokio::time::sleep(self.cfg.max_duration);
         let ended = line.ended();
@@ -939,6 +1049,24 @@ impl Bridge {
                     live.send_tool_response(&tool_id, &name, result, "WHEN_IDLE");
                 }
                 Some(news) = news_rx.recv() => live.add_context(&news),
+                Some(face) = faces.recv() => {
+                    if let Some(old) = avatar.replace(face) {
+                        tokio::spawn(old.finish());
+                    }
+                }
+                ev = avatar_event(&mut avatar) => match ev {
+                    AvatarEvent::Ready => {
+                        log::info!("call {id}: the avatar is live");
+                        if let Some(a) = &mut avatar {
+                            a.ready = true;
+                        }
+                    }
+                    AvatarEvent::Audio(pcm) => playout.push(&pcm),
+                    AvatarEvent::Exited(why) => {
+                        log::warn!("call {id}: avatar stopped ({why}); continuing with voice only");
+                        avatar = None;
+                    }
+                },
                 Some(text) = text_rx.recv() => {
                     log::info!("call {id}: owner texted during the call");
                     if ending.owner_spoke(Instant::now()) {
@@ -949,7 +1077,16 @@ impl Bridge {
                     live.send_text(&format!("(The owner just texted you this during the call: {text})"));
                 }
                 _ = check.tick() => {
-                    let playing = playout.buffered() > 0;
+                    if let Some(a) = &mut avatar
+                        && a.ready
+                        && !a.speaking
+                        && playout.buffered() == 0
+                    {
+                        a.speaking = true;
+                        log::info!("call {id}: speech now goes through the avatar");
+                    }
+                    let playing = playout.buffered() > 0
+                        || avatar.as_ref().is_some_and(|a| a.busy(Instant::now()));
                     if playing {
                         timeline.sound(Instant::now());
                     }
@@ -961,10 +1098,17 @@ impl Bridge {
                 ev = live.events.recv() => match ev {
                     Some(LiveEvent::Audio(pcm)) => {
                         timeline.model_audio(Instant::now());
-                        playout.push(&down.process(&pcm));
+                        let speech = down.process(&pcm);
+                        match &mut avatar {
+                            Some(a) if a.speaking => a.say(speech),
+                            _ => playout.push(&speech),
+                        }
                     }
                     Some(LiveEvent::Interrupted) => {
                         playout.clear();
+                        if let Some(a) = &mut avatar {
+                            a.clear();
+                        }
                         if ending.owner_spoke(Instant::now()) {
                             live.send_text(STILL_CONNECTED);
                         }
@@ -1045,6 +1189,13 @@ impl Bridge {
         };
 
         *self.texts.lock().unwrap() = None;
+        if let Some(a) = avatar.take() {
+            a.finish().await;
+        }
+        faces.close();
+        while let Ok(face) = faces.try_recv() {
+            face.finish().await;
+        }
         pacer.abort();
         tool_tasks.values().for_each(JoinHandle::abort);
         drop(live);
@@ -1157,6 +1308,18 @@ impl Bridge {
             truncate(&summary, 3500)
         );
         self.message_owner(id, text).await;
+    }
+}
+
+/// The face's next event; never resolves while there is no face.
+async fn avatar_event(avatar: &mut Option<Avatar>) -> AvatarEvent {
+    match avatar {
+        Some(a) => a
+            .events
+            .recv()
+            .await
+            .unwrap_or_else(|| AvatarEvent::Exited("avatar bridge stopped".into())),
+        None => std::future::pending().await,
     }
 }
 

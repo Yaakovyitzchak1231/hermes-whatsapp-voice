@@ -41,6 +41,7 @@ async fn health(State(bridge): State<Arc<Bridge>>, headers: HeaderMap) -> ApiRes
         "logged_in": bridge.client.as_ref().is_some_and(|c| c.is_logged_in()),
         "active_call": bridge.calls.active(),
         "hermes_connected": !bridge.cfg.hermes_api_key.is_empty(),
+        "video_avatar": bridge.cfg.avatar.is_some(),
     }))
     .into_response())
 }
@@ -50,6 +51,9 @@ struct StartCall {
     reason: String,
     #[serde(default)]
     details: String,
+    /// Video call with the avatar; unset follows the `video_calls` setting.
+    #[serde(default)]
+    video: Option<bool>,
 }
 
 async fn start_call(
@@ -68,6 +72,13 @@ async fn start_call(
             "not connected to WhatsApp",
         ));
     }
+    let video = body.video.unwrap_or(bridge.cfg.video_calls);
+    if body.video == Some(true) && bridge.cfg.avatar.is_none() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "video calls are off: set video_avatar to simli",
+        ));
+    }
     let record = bridge
         .begin_outbound(&reason)
         .map_err(|e| error(StatusCode::CONFLICT, e.to_string()))?;
@@ -75,6 +86,7 @@ async fn start_call(
         record.id.clone(),
         reason,
         body.details.trim().to_string(),
+        video && bridge.cfg.avatar.is_some(),
     ));
     Ok((StatusCode::ACCEPTED, Json(record)).into_response())
 }

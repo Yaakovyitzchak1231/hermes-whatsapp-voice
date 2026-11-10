@@ -6,6 +6,7 @@
 //! Normally started through `hermes whatsapp-voice ...`, which supplies the environment.
 
 mod audio;
+mod avatar;
 mod calls;
 mod config;
 mod core;

@@ -28,6 +28,10 @@ optional_env:
   - name: API_SERVER_KEY
     description: "Hermes API server key; lets the voice agent hand real work to Hermes during a call"
     secret: true
+  - name: SIMLI_API_KEY
+    description: "Simli API key, for video calls with a live avatar (only needed when video_avatar is simli)"
+    url: "https://app.simli.com"
+    secret: true
 config_schema:
   context_mode:
     type: str
@@ -162,3 +166,24 @@ config_schema:
     default: "http://127.0.0.1:8642"
     label: "Hermes API URL"
     description: "Where the voice reaches Hermes."
+  video_avatar:
+    type: str
+    default: "off"
+    choices: ["off", "simli"]
+    label: "Video avatar"
+    description: "simli: video calls show a live, lip-synced face (Simli) speaking the voice. Needs SIMLI_API_KEY and `hermes whatsapp-voice avatar-setup`. off: voice calls only."
+  simli_face_id:
+    type: str
+    default: "a36d66df-a23d-4569-996b-d0e990019857"
+    label: "Avatar face"
+    description: "Simli face ID: a preset from docs.simli.com/api-reference/preset-faces, or one you created in the Simli dashboard."
+  video_calls:
+    type: bool
+    default: true
+    label: "Call me on video"
+    description: "With the avatar on, calls Hermes places are video calls. Your own calls are answered the way you place them (voice or video); switching to video mid-call brings the avatar in."
+  avatar_python:
+    type: str
+    default: ""
+    label: "Avatar Python"
+    description: "Python interpreter for the avatar bridge. Blank uses the one avatar-setup installed."

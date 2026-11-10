@@ -49,6 +49,10 @@ SETTINGS: dict[str, Any] = {
     "voice_api_url": "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
     "answer_inbound": True,
     "send_summary": True,
+    "video_avatar": "off",
+    "simli_face_id": "a36d66df-a23d-4569-996b-d0e990019857",
+    "video_calls": True,
+    "avatar_python": "",
 }
 
 
@@ -151,6 +155,14 @@ def gemini_key() -> str:
     return get_secret("GOOGLE_API_KEY") or get_secret("GEMINI_API_KEY") or ""
 
 
+def avatar_python(s: dict[str, Any]) -> str:
+    """The interpreter for the avatar bridge: the setting, else the venv `avatar-setup` made."""
+    if s["avatar_python"]:
+        return str(s["avatar_python"])
+    venv = data_dir() / "avatar-venv" / "bin" / "python"
+    return str(venv) if venv.exists() else "python3"
+
+
 def sidecar_env(ctx) -> dict[str, str]:
     """Environment for the sidecar. Secrets are resolved here, through Hermes."""
     from agent.secret_scope import get_secret
@@ -184,6 +196,12 @@ def sidecar_env(ctx) -> dict[str, str]:
         "HERMES_API_URL": str(s["hermes_api_url"]),
         "GEMINI_API_KEY": gemini_key(),
         "HERMES_API_KEY": get_secret("API_SERVER_KEY") or "",
+        "HWV_VIDEO_AVATAR": str(s["video_avatar"]),
+        "HWV_VIDEO_CALLS": "true" if s["video_calls"] else "false",
+        "HWV_SIMLI_FACE_ID": str(s["simli_face_id"]),
+        "HWV_AVATAR_PYTHON": avatar_python(s),
+        "HWV_AVATAR_SCRIPT": str(PLUGIN_DIR / "sidecar" / "bridge" / "simli_bridge.py"),
+        "SIMLI_API_KEY": get_secret("SIMLI_API_KEY") or "",
     }
     return env
 
@@ -221,8 +239,11 @@ class Client:
     def health(self) -> dict:
         return self._request("GET", "/health")
 
-    def start_call(self, reason: str, details: str = "") -> dict:
-        return self._request("POST", "/calls", {"reason": reason, "details": details})
+    def start_call(self, reason: str, details: str = "", video: bool | None = None) -> dict:
+        body: dict[str, Any] = {"reason": reason, "details": details}
+        if video is not None:
+            body["video"] = video
+        return self._request("POST", "/calls", body)
 
     def get_call(self, call_id: str) -> dict:
         return self._request("GET", f"/calls/{urllib.parse.quote(call_id, safe='')}")
