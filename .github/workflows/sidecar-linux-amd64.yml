@@ -1,0 +1,37 @@
+# Builds the sidecar release binary for linux_amd64 on GitHub Actions (native builds OOM on small hosts).
+# Runs fmt, clippy -D warnings, tests, then a release build uploaded as an artifact.
+name: sidecar-linux-amd64
+
+on:
+  push:
+    branches: [video-avatar]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: sidecar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sidecar
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - run: cp target/release/hermes-wa-voice hermes-wa-voice_linux_amd64 && sha256sum hermes-wa-voice_linux_amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-wa-voice_linux_amd64
+          path: sidecar/hermes-wa-voice_linux_amd64
+          if-no-files-found: error
