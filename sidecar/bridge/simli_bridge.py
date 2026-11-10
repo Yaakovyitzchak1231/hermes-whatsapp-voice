@@ -43,6 +43,9 @@ OUT_READY, OUT_VIDEO, OUT_AUDIO = 0x10, 0x11, 0x12
 # sidecar's playout fills gaps with silence on its own real-time clock, so dropping them keeps the
 # timing and lets the sidecar tell "the assistant is speaking" from "the line is idle".
 SILENCE_PEAK = 24
+RTP_CLOCK = fractions.Fraction(1, 90_000)
+# Frames waiting on the encoder before new ones are skipped; bursts after a stall stay smooth.
+MAX_INFLIGHT = 4
 
 
 def log(msg):
@@ -165,29 +168,38 @@ async def serve(args):
 
     async def video():
         started = None
+        first_pts = None
         ready_sent = False
-        pending = None
+        inflight = 0
         async for frame in client.getVideoStreamIterator("yuv420p"):
             if stop.is_set():
                 break
             now = time.monotonic()
             if started is None:
                 started = now
-            if pending is not None and not pending.done():
-                # The encoder is behind: skip this frame rather than queue latency.
+            # Simli's own RTP clock (90 kHz) keeps the motion smooth even when a busy host hands
+            # frames over in bursts; arrival time is the fallback.
+            if frame.pts is not None and frame.time_base == RTP_CLOCK:
+                if first_pts is None:
+                    first_pts = frame.pts
+                stamp = frame.pts - first_pts
+            else:
+                stamp = int((now - started) * 90_000)
+            if inflight >= MAX_INFLIGHT:
+                # The encoder is really behind: skip rather than queue latency.
                 stats["late"] += 1
                 continue
             if frame.width != args.width or frame.height != args.height:
                 frame = frame.reformat(width=args.width, height=args.height, format="yuv420p")
             frame.pts = stats["frames"]
             stats["frames"] += 1
-            # Capture time on the 90 kHz RTP clock: frames go out as Simli delivers them, so
-            # WhatsApp plays them at Simli's real pace even if it isn't exactly --fps.
-            ts = struct.pack("<I", int((now - started) * 90_000) & 0xFFFFFFFF)
+            ts = struct.pack("<I", stamp & 0xFFFFFFFF)
+            inflight += 1
             pending = loop.run_in_executor(encoder, encode, frame)
 
             def sent(fut, ts=ts):
-                nonlocal ready_sent
+                nonlocal ready_sent, inflight
+                inflight -= 1
                 if fut.cancelled() or fut.exception():
                     return
                 for data, key in fut.result():
@@ -353,7 +365,7 @@ def main():
     p.add_argument("--stream-height", type=int, default=1024)
     p.add_argument("--width", type=int, default=576, help="H.264 output width (even)")
     p.add_argument("--height", type=int, default=1024, help="H.264 output height (even)")
-    p.add_argument("--fps", type=int, default=20)
+    p.add_argument("--fps", type=int, default=25)
     p.add_argument("--bitrate", type=int, default=1000, help="H.264 bitrate cap, kbps")
     p.add_argument("--max-session", type=int, default=900, help="hard cap, seconds")
     p.add_argument("--max-idle", type=int, default=300)
