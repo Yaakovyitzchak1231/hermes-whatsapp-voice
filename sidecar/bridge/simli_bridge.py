@@ -74,13 +74,15 @@ async def run(args):
         maxSessionLength=args.max_session,
         maxIdleTime=args.max_idle,
         handleSilence=True,
-        streaming_width=args.size,
-        streaming_height=args.size,
+        streaming_width=args.stream_width,
+        streaming_height=args.stream_height,
+        avatar_position_x=0.5,
+        avatar_position_y=1.0,
     )
     client = SimliClient(api_key, cfg)
 
     enc = av.CodecContext.create("libx264", "w")
-    enc.width, enc.height = args.width, args.height
+    enc.width, enc.height = args.width, args.height  # 9:16 portrait by default
     enc.pix_fmt = "yuv420p"
     enc.framerate = args.fps
     enc.time_base = __import__("fractions").Fraction(1, args.fps)
@@ -120,9 +122,11 @@ def main():
     p.add_argument("--stdin-pcm", action="store_true")
     p.add_argument("--h264-out", required=True)
     p.add_argument("--audio-out", required=True)
-    p.add_argument("--size", type=int, default=512, help="Simli stream size (square), >=512")
-    p.add_argument("--width", type=int, default=480)
-    p.add_argument("--height", type=int, default=640)
+    # Simli Trinity-2 canvas: width >=512, aspect 1:1, 16:9 or 9:16. Default portrait 9:16.
+    p.add_argument("--stream-width", type=int, default=576)
+    p.add_argument("--stream-height", type=int, default=1024)
+    p.add_argument("--width", type=int, default=576, help="H.264 output width (even)")
+    p.add_argument("--height", type=int, default=1024, help="H.264 output height (even)")
     p.add_argument("--fps", type=int, default=20)
     p.add_argument("--max-session", type=int, default=60)
     p.add_argument("--max-idle", type=int, default=20)
