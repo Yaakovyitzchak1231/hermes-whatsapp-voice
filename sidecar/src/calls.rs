@@ -599,7 +599,8 @@ impl Bridge {
         // The face starts while the phone rings: Simli takes several seconds to come up.
         let face = if video { self.start_avatar(&id) } else { None };
         self.ring_signals.start();
-        let mut call = client.voip().call(&self.owner_jid()).audio(mic_rx, spk_tx);
+        let (voip, owner) = (client.voip(), self.owner_jid());
+        let mut call = voip.call(&owner).audio(mic_rx, spk_tx);
         let mut avatar = None;
         if let Some((face, picture)) = face {
             call = call.video(picture, discard_peer_video());
@@ -704,7 +705,8 @@ impl Bridge {
         } else {
             None
         };
-        let mut answer = client.voip().accept(&call).audio(mic_rx, spk_tx);
+        let voip = client.voip();
+        let mut answer = voip.accept(&call).audio(mic_rx, spk_tx);
         let mut avatar = None;
         if let Some((face, picture)) = face {
             answer = answer.video(picture, discard_peer_video());
