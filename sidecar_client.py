@@ -51,6 +51,7 @@ SETTINGS: dict[str, Any] = {
     "send_summary": True,
     "video_avatar": "off",
     "simli_face_id": "a36d66df-a23d-4569-996b-d0e990019857",
+    "tavus_face_id": "r3f4182ef554",
     "video_calls": True,
     "avatar_python": "",
 }
@@ -155,6 +156,11 @@ def gemini_key() -> str:
     return get_secret("GOOGLE_API_KEY") or get_secret("GEMINI_API_KEY") or ""
 
 
+def avatar_provider(s: dict[str, Any]) -> str:
+    """The avatar provider whose bridge script runs: tavus, or simli (also when video is off)."""
+    return "tavus" if s["video_avatar"] == "tavus" else "simli"
+
+
 def avatar_python(s: dict[str, Any]) -> str:
     """The interpreter for the avatar bridge: the setting, else the venv `avatar-setup` made."""
     if s["avatar_python"]:
@@ -199,9 +205,11 @@ def sidecar_env(ctx) -> dict[str, str]:
         "HWV_VIDEO_AVATAR": str(s["video_avatar"]),
         "HWV_VIDEO_CALLS": "true" if s["video_calls"] else "false",
         "HWV_SIMLI_FACE_ID": str(s["simli_face_id"]),
+        "HWV_TAVUS_FACE_ID": str(s["tavus_face_id"]),
         "HWV_AVATAR_PYTHON": avatar_python(s),
-        "HWV_AVATAR_SCRIPT": str(PLUGIN_DIR / "sidecar" / "bridge" / "simli_bridge.py"),
+        "HWV_AVATAR_SCRIPT": str(PLUGIN_DIR / "sidecar" / "bridge" / f"{avatar_provider(s)}_bridge.py"),
         "SIMLI_API_KEY": get_secret("SIMLI_API_KEY") or "",
+        "TAVUS_API_KEY": get_secret("TAVUS_API_KEY") or "",
     }
     return env
 

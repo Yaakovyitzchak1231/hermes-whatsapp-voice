@@ -1,3 +1,5 @@
-# Avatar bridge (simli_bridge.py). Installed into a private venv by `hermes whatsapp-voice avatar-setup`.
+# Avatar bridges (simli_bridge.py, tavus_bridge.py). Installed into a private venv by `hermes whatsapp-voice avatar-setup`.
 simli-ai[livekit]==2.1.1
 av==19.0.2
+daily-python==0.37.0
+numpy==2.5.4

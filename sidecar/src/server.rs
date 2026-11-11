@@ -76,7 +76,7 @@ async fn start_call(
     if body.video == Some(true) && bridge.cfg.avatar.is_none() {
         return Err(error(
             StatusCode::BAD_REQUEST,
-            "video calls are off: set video_avatar to simli",
+            "video calls are off: set video_avatar to simli or tavus",
         ));
     }
     let record = bridge

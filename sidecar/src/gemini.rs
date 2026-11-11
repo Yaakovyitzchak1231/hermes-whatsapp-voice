@@ -278,6 +278,16 @@ impl Live {
         let _ = self.outbox.send(Outgoing::Audio(msg.to_string()));
     }
 
+    /// One still of the owner's camera, so the model can see them. Dropped, like audio, if the
+    /// connection turns over.
+    pub fn send_image(&self, jpeg: &[u8]) {
+        let msg = json!({"realtimeInput": {"video": {
+            "data": B64.encode(jpeg),
+            "mimeType": "image/jpeg",
+        }}});
+        let _ = self.outbox.send(Outgoing::Audio(msg.to_string()));
+    }
+
     pub fn send_text(&self, text: &str) {
         self.send(json!({"realtimeInput": {"text": text}}));
     }

@@ -171,7 +171,7 @@ def _avatar_setup() -> None:
     subprocess.run(
         [str(venv / "bin" / "python"), "-m", "pip", "install", "--quiet", "-r", str(requirements)], check=True
     )
-    print(f"Avatar packages installed in {venv}. Set video_avatar to simli and restart the sidecar.")
+    print(f"Avatar packages installed in {venv}. Set video_avatar to simli or tavus and restart the sidecar.")
 
 
 def _calls(ctx, limit: int) -> None:
@@ -195,7 +195,7 @@ def setup_parser(subparser) -> None:
     kind = call.add_mutually_exclusive_group()
     kind.add_argument("--video", dest="video", action="store_true", default=None, help="Video call with the avatar")
     kind.add_argument("--voice", dest="video", action="store_false", help="Voice-only call")
-    subs.add_parser("avatar-setup", help="Install the Python packages the video avatar (Simli) needs")
+    subs.add_parser("avatar-setup", help="Install the Python packages the video avatar (Simli or Tavus) needs")
     calls = subs.add_parser("calls", help="Show recent calls: transcript, end reason and timing metrics")
     calls.add_argument("--limit", type=int, default=5)
 

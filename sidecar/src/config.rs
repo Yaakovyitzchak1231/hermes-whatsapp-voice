@@ -54,7 +54,7 @@ pub struct Config {
     pub context_url: String,
     /// Words transcription should spell as given (names).
     pub vocabulary: Vec<String>,
-    /// The face for video calls (a Simli avatar); None leaves every call voice-only.
+    /// The face for video calls (a Simli or Tavus avatar); None leaves every call voice-only.
     pub avatar: Option<AvatarConfig>,
     /// Calls Hermes places are video calls when the face is set up (a call can still ask for
     /// voice only).
@@ -112,20 +112,24 @@ fn live_config(raw: &str) -> Result<serde_json::Value> {
     Ok(value)
 }
 
-/// The Simli bridge settings, when video calls are on.
+/// The avatar bridge settings, when video calls are on.
 fn avatar_config(max_call: Duration, ring: Duration) -> Result<Option<AvatarConfig>> {
-    match var("HWV_VIDEO_AVATAR", "off").as_str() {
-        "off" => Ok(None),
-        "simli" => Ok(Some(AvatarConfig {
-            python: var("HWV_AVATAR_PYTHON", "python3"),
-            script: PathBuf::from(required("HWV_AVATAR_SCRIPT")?),
-            face_id: required("HWV_SIMLI_FACE_ID")?,
-            api_key: required("SIMLI_API_KEY")?,
-            // The session starts at dialing, so it must outlast the ring and the longest call.
-            max_session: max_call + ring + Duration::from_secs(60),
-        })),
-        other => bail!("HWV_VIDEO_AVATAR must be off or simli, got {other:?}"),
-    }
+    let provider = var("HWV_VIDEO_AVATAR", "off");
+    let (face, key, expressive) = match provider.as_str() {
+        "off" => return Ok(None),
+        "simli" => ("HWV_SIMLI_FACE_ID", "SIMLI_API_KEY", false),
+        "tavus" => ("HWV_TAVUS_FACE_ID", "TAVUS_API_KEY", true),
+        other => bail!("HWV_VIDEO_AVATAR must be off, simli or tavus, got {other:?}"),
+    };
+    Ok(Some(AvatarConfig {
+        python: var("HWV_AVATAR_PYTHON", "python3"),
+        script: PathBuf::from(required("HWV_AVATAR_SCRIPT")?),
+        face_id: required(face)?,
+        key: (key.to_string(), required(key)?),
+        expressive,
+        // The session starts at dialing, so it must outlast the ring and the longest call.
+        max_session: max_call + ring + Duration::from_secs(60),
+    }))
 }
 
 pub fn digits(number: &str) -> String {

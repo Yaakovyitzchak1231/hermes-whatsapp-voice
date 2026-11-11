@@ -1,5 +1,7 @@
-//! The face of a video call: a Simli bridge process (`sidecar/bridge/simli_bridge.py`) turns the
-//! voice model's speech into a lip-synced talking face. It hands back H.264 access units for the
+//! The face of a video call: a bridge process (`sidecar/bridge/simli_bridge.py` or
+//! `tavus_bridge.py`) turns the voice model's speech into a lip-synced talking face. The Tavus
+//! face is expressive: it takes emotion cues, and it hands back snapshots of the owner's camera
+//! so the voice model can see them. It hands back H.264 access units for the
 //! call's video and its own copy of the speech, which the call plays instead of the raw model audio
 //! so lips and voice stay together.
 //!
@@ -23,9 +25,12 @@ use crate::audio::{i16_to_le_bytes, le_bytes_to_i16};
 const MSG_AUDIO: u8 = 0x01;
 const MSG_CLEAR: u8 = 0x02;
 const MSG_END: u8 = 0x03;
+const MSG_EMOTION: u8 = 0x04;
+const MSG_CAMERA: u8 = 0x05;
 const OUT_READY: u8 = 0x10;
 const OUT_VIDEO: u8 = 0x11;
 const OUT_AUDIO: u8 = 0x12;
+const OUT_SNAPSHOT: u8 = 0x13;
 /// Largest message the bridge may send; a keyframe at its bitrate cap is far smaller.
 const MAX_MESSAGE: usize = 4 << 20;
 /// Access units waiting for the call. When the call falls behind, frames are skipped from a
@@ -39,14 +44,29 @@ const SAMPLE_RATE: f64 = 16_000.0;
 
 #[derive(Clone, Debug)]
 pub struct AvatarConfig {
-    /// Python interpreter with the bridge's packages (simli-ai, av).
+    /// Python interpreter with the bridge's packages (simli-ai or daily-python, av).
     pub python: String,
     pub script: PathBuf,
     pub face_id: String,
-    pub api_key: String,
-    /// Hard cap on one Simli session, so a stuck call can never use up the account's minutes.
+    /// The provider's API key, as (variable, value) for the bridge's environment.
+    pub key: (String, String),
+    /// The face shows emotions on cue and watches the owner's camera (Tavus).
+    pub expressive: bool,
+    /// Hard cap on one session, so a stuck call can never use up the account's minutes.
     pub max_session: Duration,
 }
+
+/// Emotions the expressive face can show.
+pub const EMOTIONS: [&str; 8] = [
+    "neutral",
+    "happiness",
+    "sadness",
+    "anger",
+    "fear",
+    "surprise",
+    "disgust",
+    "contempt",
+];
 
 #[derive(Debug, PartialEq)]
 pub enum AvatarEvent {
@@ -54,6 +74,8 @@ pub enum AvatarEvent {
     Ready,
     /// Lip-synced speech to play into the call (16 kHz mono).
     Audio(Vec<i16>),
+    /// A JPEG of the owner's camera, about once a second.
+    Snapshot(Vec<u8>),
     Exited(String),
 }
 
@@ -62,6 +84,8 @@ enum Msg {
     Audio(Vec<i16>),
     Clear,
     End,
+    Emotion(String),
+    Camera(Vec<u8>),
 }
 
 /// A running bridge for one call.
@@ -75,8 +99,9 @@ pub struct Avatar {
     /// The call's speech goes through the face. Switched on at a quiet moment after `ready`, so
     /// a sentence never jumps from the plain voice to the face halfway through.
     pub speaking: bool,
-    /// When the speech already handed to Simli finishes playing back.
+    /// When the speech already handed to the face finishes playing back.
     talking_until: Option<Instant>,
+    pub expressive: bool,
 }
 
 /// The call's video: the bridge's access units with their capture timestamps.
@@ -99,7 +124,7 @@ impl VideoSource for AvatarVideo {
     }
 }
 
-/// A sink for the owner's camera, which nobody watches: frames are read and dropped.
+/// A sink for the owner's camera when the face does not watch it: frames are read and dropped.
 pub fn discard_peer_video() -> async_channel::Sender<VideoFrame> {
     let (tx, rx) = async_channel::bounded::<VideoFrame>(4);
     tokio::spawn(async move { while rx.recv().await.is_ok() {} });
@@ -112,7 +137,7 @@ impl Avatar {
             .arg(&cfg.script)
             .args(["--serve", "--face-id", &cfg.face_id])
             .args(["--max-session", &cfg.max_session.as_secs().to_string()])
-            .env("SIMLI_API_KEY", &cfg.api_key)
+            .env(&cfg.key.0, &cfg.key.1)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // The bridge's own log lines land in the sidecar's log.
@@ -143,6 +168,7 @@ impl Avatar {
             ready: false,
             speaking: false,
             talking_until: None,
+            expressive: cfg.expressive,
         };
         Ok((avatar, AvatarVideo { timed: video_rx }))
     }
@@ -154,6 +180,33 @@ impl Avatar {
         let start = self.talking_until.map_or(now, |t| t.max(now));
         self.talking_until = Some(start + length);
         let _ = self.to_bridge.send(Msg::Audio(pcm));
+    }
+
+    /// Shows an emotion on the face (one of [`EMOTIONS`]); ignored by faces that cannot.
+    pub fn express(&self, emotion: &str) {
+        if self.expressive {
+            let _ = self.to_bridge.send(Msg::Emotion(emotion.to_string()));
+        }
+    }
+
+    /// Where the call delivers the owner's camera. An expressive face gets every access unit
+    /// from the first keyframe on, and sends back snapshots the voice model can look at.
+    pub fn camera(&self) -> async_channel::Sender<VideoFrame> {
+        if !self.expressive {
+            return discard_peer_video();
+        }
+        let (tx, rx) = async_channel::bounded::<VideoFrame>(16);
+        let to_bridge = self.to_bridge.clone();
+        tokio::spawn(async move {
+            let mut started = false;
+            while let Ok(frame) = rx.recv().await {
+                started |= frame.keyframe;
+                if started && to_bridge.send(Msg::Camera(frame.data)).is_err() {
+                    break;
+                }
+            }
+        });
+        tx
     }
 
     /// The owner barged in: drop the speech the face has not said yet.
@@ -168,7 +221,7 @@ impl Avatar {
             .is_some_and(|until| now < until + RENDER_LATENCY)
     }
 
-    /// Ends the Simli session and the bridge process.
+    /// Ends the face's session and the bridge process.
     pub async fn finish(mut self) {
         let _ = self.to_bridge.send(Msg::End);
         if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
@@ -214,6 +267,8 @@ async fn write_bridge(mut w: impl AsyncWrite + Unpin, mut rx: mpsc::UnboundedRec
             Msg::Audio(pcm) => (MSG_AUDIO, i16_to_le_bytes(&pcm)),
             Msg::Clear => (MSG_CLEAR, Vec::new()),
             Msg::End => (MSG_END, Vec::new()),
+            Msg::Emotion(e) => (MSG_EMOTION, e.into_bytes()),
+            Msg::Camera(au) => (MSG_CAMERA, au),
         };
         if w.write_all(&encode(kind, &payload)).await.is_err() || w.flush().await.is_err() {
             return;
@@ -289,6 +344,9 @@ async fn read_bridge(
             OUT_AUDIO => {
                 let _ = events.send(AvatarEvent::Audio(le_bytes_to_i16(&payload)));
             }
+            OUT_SNAPSHOT if payload.starts_with(&[0xff, 0xd8]) => {
+                let _ = events.send(AvatarEvent::Snapshot(payload));
+            }
             _ => {}
         }
     };
@@ -333,6 +391,8 @@ mod tests {
         video.extend_from_slice(IDR);
         wire.extend(encode(OUT_VIDEO, &video));
         wire.extend(encode(OUT_AUDIO, &i16_to_le_bytes(&[1, -2, 3])));
+        wire.extend(encode(OUT_SNAPSHOT, b"not a jpeg"));
+        wire.extend(encode(OUT_SNAPSHOT, &[0xff, 0xd8, 0xff, 0xd9]));
 
         let (vtx, vrx) = async_channel::bounded(8);
         let (etx, mut erx) = mpsc::unbounded_channel();
@@ -340,6 +400,11 @@ mod tests {
 
         assert_eq!(erx.recv().await, Some(AvatarEvent::Ready));
         assert_eq!(erx.recv().await, Some(AvatarEvent::Audio(vec![1, -2, 3])));
+        assert_eq!(
+            erx.recv().await,
+            Some(AvatarEvent::Snapshot(vec![0xff, 0xd8, 0xff, 0xd9])),
+            "only JPEG snapshots pass"
+        );
         assert!(matches!(erx.recv().await, Some(AvatarEvent::Exited(_))));
         // The P frame came before any keyframe, so only the IDR reaches the call.
         let frame = vrx.recv().await.unwrap();
@@ -352,6 +417,8 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send(Msg::Audio(vec![7, -7])).unwrap();
         tx.send(Msg::Clear).unwrap();
+        tx.send(Msg::Emotion("happiness".into())).unwrap();
+        tx.send(Msg::Camera(vec![0, 0, 0, 1, 0x65])).unwrap();
         tx.send(Msg::End).unwrap();
         let mut wire = Vec::new();
         write_bridge(&mut wire, rx).await;
@@ -363,6 +430,14 @@ mod tests {
         assert_eq!(
             read_message(&mut r).await.unwrap(),
             Some((MSG_CLEAR, vec![]))
+        );
+        assert_eq!(
+            read_message(&mut r).await.unwrap(),
+            Some((MSG_EMOTION, b"happiness".to_vec()))
+        );
+        assert_eq!(
+            read_message(&mut r).await.unwrap(),
+            Some((MSG_CAMERA, vec![0, 0, 0, 1, 0x65]))
         );
         assert_eq!(read_message(&mut r).await.unwrap(), Some((MSG_END, vec![])));
         assert_eq!(read_message(&mut r).await.unwrap(), None);

@@ -13,11 +13,11 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use whatsapp_rust::async_channel;
 use whatsapp_rust::prelude::*;
-use whatsapp_rust::voip::{CallEvent, CallHandle, CallTermination};
+use whatsapp_rust::voip::{CallEvent, CallHandle, CallTermination, KeyframeUrgency};
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall};
 
 use crate::audio::{Downsampler, Playout, WavWriter};
-use crate::avatar::{Avatar, AvatarEvent, AvatarVideo, discard_peer_video};
+use crate::avatar::{Avatar, AvatarEvent, AvatarVideo, EMOTIONS};
 use crate::config::Config;
 use crate::core::{self, Core};
 use crate::gemini::{Live, LiveEvent, Setup};
@@ -76,6 +76,8 @@ pub(crate) trait Line {
     /// Resolves once the other side hangs up or the line drops.
     fn ended(&self) -> impl Future<Output = ()> + Send;
     fn hang_up(&self) -> impl Future<Output = ()> + Send;
+    /// Asks the owner's phone for a fresh camera keyframe, so the face can decode it.
+    fn request_keyframe(&self) {}
 }
 
 impl Line for CallHandle {
@@ -85,6 +87,10 @@ impl Line for CallHandle {
 
     fn hang_up(&self) -> impl Future<Output = ()> + Send {
         terminate(self)
+    }
+
+    fn request_keyframe(&self) {
+        self.request_peer_keyframe(KeyframeUrgency::Immediate);
     }
 }
 
@@ -603,7 +609,7 @@ impl Bridge {
         let mut call = voip.call(&owner).audio(mic_rx, spk_tx);
         let mut avatar = None;
         if let Some((face, picture)) = face {
-            call = call.video(picture, discard_peer_video());
+            call = call.video(picture, face.camera());
             avatar = Some(face);
         }
         let started = call.start().await;
@@ -669,10 +675,7 @@ impl Bridge {
                 let Some((face, picture)) = bridge.start_avatar(&id) else {
                     continue;
                 };
-                match handle
-                    .accept_video(token, picture, discard_peer_video())
-                    .await
-                {
+                match handle.accept_video(token, picture, face.camera()).await {
                     Ok(()) => {
                         log::info!("call {id}: owner switched to video; the avatar joined");
                         has_face = true;
@@ -709,7 +712,7 @@ impl Bridge {
         let mut answer = voip.accept(&call).audio(mic_rx, spk_tx);
         let mut avatar = None;
         if let Some((face, picture)) = face {
-            answer = answer.video(picture, discard_peer_video());
+            answer = answer.video(picture, face.camera());
             avatar = Some(face);
         }
         let handle = match answer.start().await {
@@ -811,6 +814,7 @@ impl Bridge {
             context,
         );
         let mut functions = vec![end_call_function()];
+        functions.extend(self.expression_function());
         if self.hermes.is_some() {
             functions.push(json!({
                 "name": "ask_hermes",
@@ -842,10 +846,28 @@ impl Bridge {
         }
     }
 
+    /// The face's emotion control, offered when the avatar can show emotions.
+    fn expression_function(&self) -> Option<Value> {
+        self.cfg.avatar.as_ref().filter(|a| a.expressive)?;
+        Some(json!({
+            "name": "set_expression",
+            "description": "On a video call, change the emotion your face shows. Call it as your feelings \
+                change, before or while you speak: happiness when glad or joking, surprise at news, \
+                sadness or concern for bad news, neutral when calm. Never mention it out loud.",
+            "parameters": {
+                "type": "object",
+                "properties": {"emotion": {"type": "string", "enum": EMOTIONS}},
+                "required": ["emotion"],
+            },
+            "behavior": "NON_BLOCKING",
+        }))
+    }
+
     /// Setup when the voice acts as the owner's DM session: that session's prompt, history and tools.
     fn core_setup(&self, ctx: core::CallContext) -> Setup {
         let mut functions = ctx.functions;
         functions.push(end_call_function());
+        functions.extend(self.expression_function());
         functions.extend(core::bridge_functions());
         let mut vocabulary = self.cfg.vocabulary.clone();
         vocabulary.extend(ctx.vocabulary);
@@ -1026,6 +1048,9 @@ impl Bridge {
         // Video calls: the face says the model's speech, and the call plays the face's copy so the
         // lips match. Until the face is live (or if it fails), the plain voice plays.
         let mut avatar: Option<Avatar> = None;
+        // The owner's camera: when the last snapshot came, and when a keyframe was last asked for.
+        let mut last_snapshot: Option<Instant> = None;
+        let mut keyframe_asked = Instant::now();
         let mut check = tokio::time::interval(Duration::from_millis(200));
         let max_duration = tokio::time::sleep(self.cfg.max_duration);
         let ended = line.ended();
@@ -1061,9 +1086,21 @@ impl Bridge {
                         log::info!("call {id}: the avatar is live");
                         if let Some(a) = &mut avatar {
                             a.ready = true;
+                            if a.expressive {
+                                live.add_context(VIDEO_NOTE);
+                                line.request_keyframe();
+                                keyframe_asked = Instant::now();
+                            }
                         }
                     }
                     AvatarEvent::Audio(pcm) => playout.push(&pcm),
+                    AvatarEvent::Snapshot(jpeg) => {
+                        if last_snapshot.is_none() {
+                            log::info!("call {id}: the face sees the owner's camera");
+                        }
+                        last_snapshot = Some(Instant::now());
+                        live.send_image(&jpeg);
+                    }
                     AvatarEvent::Exited(why) => {
                         log::warn!("call {id}: avatar stopped ({why}); continuing with voice only");
                         avatar = None;
@@ -1079,6 +1116,16 @@ impl Bridge {
                     live.send_text(&format!("(The owner just texted you this during the call: {text})"));
                 }
                 _ = check.tick() => {
+                    // A camera that went quiet (no keyframe yet, or one lost) gets a fresh keyframe.
+                    if let Some(a) = &avatar
+                        && a.ready
+                        && a.expressive
+                        && last_snapshot.is_none_or(|t| t.elapsed() > CAMERA_STALE)
+                        && keyframe_asked.elapsed() > CAMERA_STALE
+                    {
+                        line.request_keyframe();
+                        keyframe_asked = Instant::now();
+                    }
                     if let Some(a) = &mut avatar
                         && a.ready
                         && !a.speaking
@@ -1140,6 +1187,19 @@ impl Bridge {
                             log::info!("call {id}: ask_hermes {}", args["request"]);
                             let task = self.spawn_ask_hermes(&tool_id, id, &args, tool_tx.clone());
                             tool_tasks.insert(tool_id, task);
+                        }
+                        "set_expression" => {
+                            let emotion = args["emotion"].as_str().unwrap_or_default();
+                            let face = avatar.as_ref().filter(|a| a.expressive);
+                            let reply = if !EMOTIONS.contains(&emotion) {
+                                json!({"error": "unknown emotion"})
+                            } else if let Some(a) = face {
+                                a.express(emotion);
+                                json!({"ok": true})
+                            } else {
+                                json!({"error": "no face on this call"})
+                            };
+                            live.send_tool_response(&tool_id, &name, reply, "SILENT");
                         }
                         "end_call" => {
                             // The model sometimes asks a question and hangs up in the same turn.
@@ -1350,6 +1410,13 @@ fn system_instruction(
          {context}"
     )
 }
+
+/// Told to the voice model once the expressive face is live.
+const VIDEO_NOTE: &str = "(This is now a video call. The owner sees your face, and you get still images \
+    from their camera about once a second. React naturally to what you see when it matters, like a \
+    person would, without describing every frame. Show your feelings with set_expression as you talk.)";
+/// How long the owner's camera may stay without a snapshot before asking for a keyframe.
+const CAMERA_STALE: Duration = Duration::from_secs(4);
 
 fn end_call_function() -> Value {
     json!({
