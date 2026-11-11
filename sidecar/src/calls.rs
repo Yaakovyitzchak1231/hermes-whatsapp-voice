@@ -1275,6 +1275,8 @@ impl Bridge {
                         last_snapshot = Some(Instant::now());
                         live.send_image(&jpeg);
                     }
+                    // Only a full-pipeline face sends these, and it never joins this loop.
+                    AvatarEvent::Said { .. } | AvatarEvent::ToolCall { .. } | AvatarEvent::Hangup => {}
                     AvatarEvent::Exited(why) => {
                         log::warn!("call {id}: avatar stopped ({why}); continuing with voice only");
                         avatar = None;
