@@ -60,7 +60,11 @@ SPEECH_NOTE = (
     "voice, so never write stage directions, sound effects or anything between asterisks (no *sigh*, "
     "*sniffle*, *cough*). Show sighs, groans and moods with your face and with spoken words like "
     "'ugh', 'hmm' or 'oh man' instead. You can see the owner through their camera; react to what you "
-    "see when it matters, the way a person on a video call would."
+    "see when it matters, the way a person on a video call would.\n\nYour face shows what you feel, so "
+    "feel it big: grin when you joke or tease, look exasperated when you complain, light up with "
+    "surprise at news, soften with warmth when the owner is kind or tired. Change your mood often, "
+    "like a lively person would; a flat, neutral face looks like a robot.\n\nKeep each reply to one or "
+    "two short sentences, then let the owner talk. Answer right away; never wind up to a point."
 )
 ASK_HERMES = {
     "name": "ask_hermes",
@@ -117,6 +121,8 @@ class Pal(EventHandler):
         self.mic = self.cam = None
         self.hung_up = False
         self.last_said = {}
+        self.user_stopped = None
+        self.reply_gaps = []
         self.sizes = {}
         self.outgoing: queue.Queue = queue.Queue()
         self.dump = Dump(dump_folder())
@@ -139,7 +145,7 @@ class Pal(EventHandler):
                 "layers": {
                     "perception": {"perception_model": "raven-2", "callouts": "off"},
                     "llm": {"model": self.args.llm},
-                    "conversational_flow": {"turn_detection_model": "sparrow-2"},
+                    "conversational_flow": {"turn_detection_model": "sparrow-2", "turn_taking_patience": "low"},
                 },
             },
         )
@@ -228,7 +234,7 @@ class Pal(EventHandler):
             except Exception as e:  # noqa: BLE001 - shutting down regardless
                 log(f"{method} {path}: {e!r}")
         self.dump.close()
-        log(f"face video sizes: {self.sizes}")
+        log(f"face video sizes: {self.sizes}; reply gaps {self.reply_gaps}")
         log(
             f"session ended after {time.monotonic() - self.t0:.1f}s: {self.stats['frames']} frames "
             f"({self.stats['late']} skipped), {self.stats['heard']} bytes heard, {self.stats['said']} bytes said, "
@@ -259,6 +265,13 @@ class Pal(EventHandler):
         if not isinstance(message, dict):
             return
         event, props = message.get("event_type", ""), message.get("properties") or {}
+        if event == "conversation.stopped_speaking" and props.get("role") == "user":
+            self.user_stopped = time.monotonic()
+        elif event == "conversation.started_speaking" and props.get("role") == "pal" and self.user_stopped:
+            gap = time.monotonic() - self.user_stopped
+            self.user_stopped = None
+            self.reply_gaps.append(round(gap, 2))
+            log(f"replied {gap:.2f}s after the owner stopped")
         if event == "conversation.utterance" and props.get("speech"):
             role = {"user": "owner", "pal": "assistant"}.get(props.get("role"))
             if role:  # "replica" duplicates "pal"
