@@ -117,6 +117,9 @@ class Pal(EventHandler):
         self.mic = self.cam = None
         self.hung_up = False
         self.last_said = {}
+        self.sizes = {}
+        self.outgoing: queue.Queue = queue.Queue()
+        self.dump = Dump(dump_folder())
 
     # ---- setup
 
@@ -193,6 +196,15 @@ class Pal(EventHandler):
         if self.replica is not None:
             return
         self.replica = pid
+        # The face is cropped to portrait, so it needs the top simulcast layer, not what the SFU
+        # picks for a busy receiver.
+        self.client.update_subscriptions(
+            participant_settings={
+                pid: {
+                    "media": {"camera": {"subscriptionState": "subscribed", "receiveSettings": {"maxQuality": "high"}}}
+                }
+            }
+        )
         self.client.set_video_renderer(pid, self.on_video, video_source="camera", color_format="I420")
         self.client.set_audio_renderer(
             pid, self.on_audio, audio_source="microphone", sample_rate=IN_RATE, callback_interval_ms=20
@@ -215,6 +227,8 @@ class Pal(EventHandler):
                 api(self.key, method, path)
             except Exception as e:  # noqa: BLE001 - shutting down regardless
                 log(f"{method} {path}: {e!r}")
+        self.dump.close()
+        log(f"face video sizes: {self.sizes}")
         log(
             f"session ended after {time.monotonic() - self.t0:.1f}s: {self.stats['frames']} frames "
             f"({self.stats['late']} skipped), {self.stats['heard']} bytes heard, {self.stats['said']} bytes said, "
@@ -286,14 +300,33 @@ class Pal(EventHandler):
     def on_audio(self, _pid, data, _source):
         pcm = bytes(data.audio_frames)
         if pcm:
+            self.dump.audio(pcm)
             self.out.send(OUT_AUDIO, pcm)
             self.stats["said"] += len(pcm)
+
+    def send_loop(self):
+        """Lets each frame go `--video-delay-ms` after it was encoded. The face's speech reaches the
+        phone later than its picture (Daily hands the audio over later, and the call plays it out
+        in 60 ms frames), so the picture waits for it: measured 120 to 180 ms at the bridge."""
+        delay = self.args.video_delay_ms / 1000
+        while True:
+            item = self.outgoing.get()
+            if item is None:
+                return
+            due, payload = item
+            wait = due + delay - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            self.dump.video(payload[4:])
+            self.out.send(OUT_VIDEO, payload)
 
     def encode_loop(self):
         while True:
             frame = self.frames.get()
             if frame is None:
                 return
+            size = f"{frame.width}x{frame.height}"
+            self.sizes[size] = self.sizes.get(size, 0) + 1
             vf = portrait(frame, self.args.width, self.args.height)
             vf.pts = self.stats["frames"]
             self.stats["frames"] += 1
@@ -301,7 +334,7 @@ class Pal(EventHandler):
                 self.first_us = frame.timestamp_us
             ts = struct.pack("<I", ((frame.timestamp_us - self.first_us) * 90 // 1000) & 0xFFFFFFFF)
             for pkt in self.enc.encode(vf):
-                self.out.send(OUT_VIDEO, ts + bytes(pkt))
+                self.outgoing.put((time.monotonic(), ts + bytes(pkt)))
                 if pkt.is_keyframe and not self.ready:
                     self.ready = True
                     self.out.send(OUT_READY)
@@ -312,6 +345,54 @@ class Pal(EventHandler):
     def hear(self, pcm):
         self.mic.write_frames(pcm)
         self.stats["heard"] += len(pcm)
+
+
+def dump_folder():
+    """HWV_AVATAR_DUMP, or a fresh folder per call while `$HWV_DATA_DIR/avatar-dump` exists."""
+    if os.environ.get("HWV_AVATAR_DUMP"):
+        return os.environ["HWV_AVATAR_DUMP"]
+    data = os.environ.get("HWV_DATA_DIR", "")
+    if data and os.path.exists(os.path.join(data, "avatar-dump")):
+        return os.path.join(data, "avatar-dumps", time.strftime("%Y%m%d-%H%M%S"))
+    return ""
+
+
+class Dump:
+    """Debug: with HWV_AVATAR_DUMP set to a directory, keeps what the face sent this call (H.264,
+    PCM, and when each piece left), so lip sync can be measured after the call."""
+
+    def __init__(self, folder):
+        self.on = bool(folder)
+        if not self.on:
+            return
+        os.makedirs(folder, exist_ok=True)
+        self.t0 = time.monotonic()
+        self.h264 = open(os.path.join(folder, "face.h264"), "wb")  # noqa: SIM115 - closed in close()
+        self.pcm = open(os.path.join(folder, "face_audio.pcm"), "wb")  # noqa: SIM115
+        self.times = open(os.path.join(folder, "face_times.jsonl"), "w")  # noqa: SIM115
+        self.lock = threading.Lock()
+
+    def _mark(self, kind, n):
+        self.times.write(json.dumps([round(time.monotonic() - self.t0, 4), kind, n]) + "\n")
+
+    def video(self, au):
+        if self.on:
+            with self.lock:
+                self.h264.write(au)
+                self._mark("v", len(au))
+
+    def audio(self, pcm):
+        if self.on:
+            with self.lock:
+                self.pcm.write(pcm)
+                self._mark("a", len(pcm))
+
+    def close(self):
+        if self.on:
+            with self.lock:
+                for f in (self.h264, self.pcm, self.times):
+                    f.close()
+                self.on = False
 
 
 def fit_camera(frame, orientation):
@@ -365,6 +446,7 @@ def serve(args):
             raise RuntimeError(f"expected the call context first, got message {kind:#x}")
         pal.create(json.loads(payload))
         threading.Thread(target=pal.encode_loop, daemon=True).start()
+        threading.Thread(target=pal.send_loop, daemon=True).start()
         threading.Thread(target=camera_loop, args=(pal, camera_q), daemon=True).start()
         started = False
         deadline = pal.t0 + args.max_session
@@ -394,6 +476,7 @@ def serve(args):
                 break
     finally:
         pal.frames.put(None)
+        pal.outgoing.put(None)
         camera_q.put(None)
         pal.stop()
 
@@ -408,6 +491,12 @@ def main():
     p.add_argument("--fps", type=int, default=25)
     p.add_argument("--bitrate", type=int, default=1200)
     p.add_argument("--max-session", type=int, default=900)
+    p.add_argument(
+        "--video-delay-ms",
+        type=int,
+        default=int(os.environ.get("HWV_AVATAR_VIDEO_DELAY_MS") or 180),
+        help="hold the picture back this long so the voice catches up (lip sync)",
+    )
     args = p.parse_args()
     if not args.serve:
         p.error("only --serve is supported")

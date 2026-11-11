@@ -225,7 +225,9 @@ class Face(EventHandler):
         # Highest simulcast layer: the face is cropped to portrait, so it needs the 720p one.
         self.client.update_subscriptions(
             participant_settings={
-                pid: {"media": {"camera": {"subscriptionState": "subscribed", "settings": {"video": {"layer": 2}}}}}
+                pid: {
+                    "media": {"camera": {"subscriptionState": "subscribed", "receiveSettings": {"maxQuality": "high"}}}
+                }
             }
         )
         self.client.set_video_renderer(pid, self.on_video, video_source="camera", color_format="I420")

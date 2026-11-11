@@ -52,6 +52,7 @@ SETTINGS: dict[str, Any] = {
     "video_avatar": "off",
     "simli_face_id": "a36d66df-a23d-4569-996b-d0e990019857",
     "tavus_face_id": "rccbeedfc684",
+    "avatar_video_delay_ms": 180,
     "video_calls": True,
     "avatar_python": "",
 }
@@ -206,6 +207,7 @@ def sidecar_env(ctx) -> dict[str, str]:
         "HWV_VIDEO_CALLS": "true" if s["video_calls"] else "false",
         "HWV_SIMLI_FACE_ID": str(s["simli_face_id"]),
         "HWV_TAVUS_FACE_ID": str(s["tavus_face_id"]),
+        "HWV_AVATAR_VIDEO_DELAY_MS": str(int(s["avatar_video_delay_ms"])),
         "HWV_AVATAR_PYTHON": avatar_python(s),
         "HWV_AVATAR_SCRIPT": str(PLUGIN_DIR / "sidecar" / "bridge" / f"{avatar_provider(s)}_bridge.py"),
         "SIMLI_API_KEY": get_secret("SIMLI_API_KEY") or "",
