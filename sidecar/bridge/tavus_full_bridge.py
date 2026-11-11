@@ -54,6 +54,7 @@ from tavus_bridge import (
 MSG_CONTEXT, MSG_RESULT, MSG_START = 0x06, 0x07, 0x08
 OUT_SAID, OUT_TOOL, OUT_HANGUP = 0x14, 0x15, 0x16
 PAL_NAME = "hermes-whatsapp-video"
+PICKUP = "Hello?"
 CAMERA_W, CAMERA_H, CAMERA_FPS = 480, 640, 10
 SPEECH_NOTE = (
     "\n\nTHIS OVERRIDES ANY STYLE NOTE ABOVE: every character you write is read aloud by a speech "
@@ -123,6 +124,8 @@ class Pal(EventHandler):
         self.last_said = {}
         self.user_stopped = None
         self.reply_gaps = []
+        self.live = False
+        self.key_now = False
         self.sizes = {}
         self.outgoing: queue.Queue = queue.Queue()
         self.dump = Dump(dump_folder())
@@ -160,7 +163,9 @@ class Pal(EventHandler):
                 "face_id": self.args.face_id,
                 "conversation_name": "hermes whatsapp video",
                 "conversational_context": ctx.get("context", ""),
-                "dynamic_greeting": True,
+                # No greeting on join: the bridge joins while the phone rings and asks for the
+                # hello once the owner picks up (go_live).
+                "dynamic_greeting": False,
                 "properties": {
                     "max_call_duration": self.args.max_session,
                     "participant_left_timeout": 0,
@@ -272,8 +277,10 @@ class Pal(EventHandler):
             self.user_stopped = None
             self.reply_gaps.append(round(gap, 2))
             log(f"replied {gap:.2f}s after the owner stopped")
-        if event == "conversation.utterance" and props.get("speech"):
+        if event == "conversation.utterance" and props.get("speech") and self.live:
             role = {"user": "owner", "pal": "assistant"}.get(props.get("role"))
+            if role == "owner" and props["speech"].strip() == PICKUP:
+                return  # our own cue for the greeting, not the owner's words
             if role:  # "replica" duplicates "pal"
                 text = props["speech"]
                 # An utterance cut short and then finished arrives again in full: send only what is new.
@@ -312,7 +319,7 @@ class Pal(EventHandler):
 
     def on_audio(self, _pid, data, _source):
         pcm = bytes(data.audio_frames)
-        if pcm:
+        if pcm and self.live:
             self.dump.audio(pcm)
             self.out.send(OUT_AUDIO, pcm)
             self.stats["said"] += len(pcm)
@@ -329,6 +336,8 @@ class Pal(EventHandler):
             wait = due + delay - time.monotonic()
             if wait > 0:
                 time.sleep(wait)
+            if not self.live:
+                continue  # the phone is still ringing
             self.dump.video(payload[4:])
             self.out.send(OUT_VIDEO, payload)
 
@@ -340,6 +349,10 @@ class Pal(EventHandler):
             size = f"{frame.width}x{frame.height}"
             self.sizes[size] = self.sizes.get(size, 0) + 1
             vf = portrait(frame, self.args.width, self.args.height)
+            if self.key_now:
+                # The call starts here: a keyframe, so the phone's picture starts right away.
+                self.key_now = False
+                vf.pict_type = av.video.frame.PictureType.I
             vf.pts = self.stats["frames"]
             self.stats["frames"] += 1
             if self.first_us is None:
@@ -347,10 +360,19 @@ class Pal(EventHandler):
             ts = struct.pack("<I", ((frame.timestamp_us - self.first_us) * 90 // 1000) & 0xFFFFFFFF)
             for pkt in self.enc.encode(vf):
                 self.outgoing.put((time.monotonic(), ts + bytes(pkt)))
-                if pkt.is_keyframe and not self.ready:
+                if pkt.is_keyframe and self.live and not self.ready:
                     self.ready = True
                     self.out.send(OUT_READY)
                     log(f"face live {time.monotonic() - self.t0:.2f}s after start")
+
+    def go_live(self):
+        """The owner picked up: the face's picture and voice start going out, and a spoken "hello"
+        from the owner's side cues the greeting (the face greets in about a second)."""
+        self.key_now = True
+        self.live = True
+        self.user_stopped = time.monotonic()
+        self.send("conversation.respond", {"text": PICKUP})
+        log(f"owner picked up {time.monotonic() - self.t0:.2f}s after start")
 
     # ---- the owner, into the room
 
@@ -460,6 +482,8 @@ def serve(args):
         threading.Thread(target=pal.encode_loop, daemon=True).start()
         threading.Thread(target=pal.send_loop, daemon=True).start()
         threading.Thread(target=camera_loop, args=(pal, camera_q), daemon=True).start()
+        # Join while the phone rings, so the face is already in the room when the owner answers.
+        pal.join()
         started = False
         deadline = pal.t0 + args.max_session
         while True:
@@ -470,7 +494,7 @@ def serve(args):
                 break
             if kind == MSG_START and not started:
                 started = True
-                pal.join()
+                pal.go_live()
             elif kind == MSG_AUDIO and started:
                 pal.hear(payload)
             elif kind == MSG_CAMERA and started and len(payload) > 1:
