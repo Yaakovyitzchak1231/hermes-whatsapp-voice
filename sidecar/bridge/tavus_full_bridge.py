@@ -56,9 +56,11 @@ OUT_SAID, OUT_TOOL, OUT_HANGUP = 0x14, 0x15, 0x16
 PAL_NAME = "hermes-whatsapp-video"
 CAMERA_W, CAMERA_H, CAMERA_FPS = 480, 640, 10
 SPEECH_NOTE = (
-    "\n\nYour words are spoken aloud by your voice and face. Write only the words you say: never "
-    "stage directions, sound effects or anything in asterisks. You can see the owner through their "
-    "camera; react to what you see when it matters, the way a person on a video call would."
+    "\n\nTHIS OVERRIDES ANY STYLE NOTE ABOVE: every character you write is read aloud by a speech "
+    "voice, so never write stage directions, sound effects or anything between asterisks (no *sigh*, "
+    "*sniffle*, *cough*). Show sighs, groans and moods with your face and with spoken words like "
+    "'ugh', 'hmm' or 'oh man' instead. You can see the owner through their camera; react to what you "
+    "see when it matters, the way a person on a video call would."
 )
 ASK_HERMES = {
     "name": "ask_hermes",
@@ -316,7 +318,9 @@ def fit_camera(frame, orientation):
     """The owner's camera, upright and letterboxed into the virtual camera's portrait frame."""
     img = frame.to_ndarray(format="rgb24")
     if orientation:
-        img = np.rot90(img, k=-orientation)  # orientation counts quarter turns clockwise
+        # Quarter turns. Measured on a live call: orientation 1 turned the other way came out
+        # upside down, so the phone's turns count counter-clockwise in numpy's sense.
+        img = np.rot90(img, k=orientation)
     h, w = img.shape[:2]
     scale = min(CAMERA_W / w, CAMERA_H / h)
     nw, nh = max(2, int(w * scale) & ~1), max(2, int(h * scale) & ~1)
