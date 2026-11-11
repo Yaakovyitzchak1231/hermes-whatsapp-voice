@@ -107,13 +107,6 @@ impl Playout {
         self.queue.lock().unwrap().clear();
     }
 
-    /// Keeps at most `max` samples, dropping the oldest, so speech can never pile up into delay.
-    pub fn trim(&self, max: usize) {
-        let mut q = self.queue.lock().unwrap();
-        let excess = q.len().saturating_sub(max);
-        q.drain(..excess);
-    }
-
     pub fn buffered(&self) -> usize {
         self.queue.lock().unwrap().len()
     }
@@ -125,6 +118,89 @@ impl Playout {
         let mut frame: Vec<i16> = q.drain(..n).collect();
         frame.resize(FRAME_SAMPLES, 0);
         frame
+    }
+}
+
+/// A full-pipeline face's sound and picture, sent out in step. Each access unit is placed on the
+/// sound's timeline where it arrived (plus the measured offset between the two) and leaves with the
+/// 60 ms of sound that contains that point, stamped with the same clock: the picture and the voice
+/// reach the phone together and carry timestamps that agree.
+#[derive(Default)]
+pub struct SyncedPlayout {
+    inner: Mutex<Synced>,
+}
+
+#[derive(Default)]
+struct Synced {
+    audio: VecDeque<i16>,
+    /// Samples handed to the call so far, silence padding included: the call's sound clock.
+    sent: u64,
+    /// Access units waiting for their sound, by the sample count at which they are due.
+    frames: VecDeque<(u64, Vec<u8>)>,
+    last_ts: Option<u32>,
+}
+
+/// 90 kHz video RTP clock ticks per 16 kHz sound sample, as a fraction.
+const VIDEO_TICKS: (u64, u64) = (90_000, 16_000);
+
+impl SyncedPlayout {
+    pub fn push_audio(&self, samples: &[i16]) {
+        self.inner.lock().unwrap().audio.extend(samples);
+    }
+
+    /// One access unit of the picture. `offset` is in samples: positive when the sound that
+    /// belongs with it has not arrived yet.
+    pub fn push_video(&self, au: Vec<u8>, offset: i64) {
+        let mut s = self.inner.lock().unwrap();
+        let here = (s.sent + s.audio.len() as u64) as i64 + offset;
+        let after = s.frames.back().map_or(s.sent, |f| f.0);
+        let due = (here.max(0) as u64).max(after).max(s.sent);
+        s.frames.push_back((due, au));
+    }
+
+    /// Keeps at most `max` samples of sound, dropping the oldest; the waiting picture moves up
+    /// with it, so a trim never pulls the two apart.
+    pub fn trim(&self, max: usize) {
+        let mut s = self.inner.lock().unwrap();
+        let excess = s.audio.len().saturating_sub(max);
+        if excess == 0 {
+            return;
+        }
+        s.audio.drain(..excess);
+        let sent = s.sent;
+        for f in s.frames.iter_mut() {
+            f.0 = f.0.saturating_sub(excess as u64).max(sent);
+        }
+    }
+
+    pub fn buffered(&self) -> usize {
+        self.inner.lock().unwrap().audio.len()
+    }
+
+    /// The next 60 ms of sound (zero-padded) and the access units due with it, each with its
+    /// 90 kHz timestamp.
+    pub fn next_frame(&self) -> (Vec<i16>, Vec<(u32, Vec<u8>)>) {
+        let mut s = self.inner.lock().unwrap();
+        let n = s.audio.len().min(FRAME_SAMPLES);
+        let mut frame: Vec<i16> = s.audio.drain(..n).collect();
+        frame.resize(FRAME_SAMPLES, 0);
+        s.sent += FRAME_SAMPLES as u64;
+        let mut due = Vec::new();
+        while s.frames.front().is_some_and(|f| f.0 <= s.sent) {
+            let Some((at, au)) = s.frames.pop_front() else {
+                break;
+            };
+            let mut ts = (at * VIDEO_TICKS.0 / VIDEO_TICKS.1) as u32;
+            // Timestamps must move forward, even for two units due at the same sample.
+            if let Some(last) = s.last_ts
+                && (ts == last || ts.wrapping_sub(last) > 0x8000_0000)
+            {
+                ts = last.wrapping_add(1);
+            }
+            s.last_ts = Some(ts);
+            due.push((ts, au));
+        }
+        (frame, due)
     }
 }
 
@@ -177,6 +253,49 @@ pub fn read_wav(path: &Path) -> io::Result<(u32, Vec<i16>)> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn synced_playout_sends_the_picture_with_its_sound() {
+        let p = SyncedPlayout::default();
+        p.push_audio(&[1; FRAME_SAMPLES * 2]);
+        p.push_video(vec![7], 0); // belongs at the end of the queued sound
+        let (a, v) = p.next_frame();
+        assert_eq!(
+            (a.len(), v.len()),
+            (FRAME_SAMPLES, 0),
+            "its sound has not gone out yet"
+        );
+        let (_, v) = p.next_frame();
+        let at = (FRAME_SAMPLES * 2) as u64;
+        assert_eq!(v, vec![((at * 90_000 / 16_000) as u32, vec![7])]);
+    }
+
+    #[test]
+    fn synced_playout_offset_and_trim_keep_the_pair_together() {
+        let p = SyncedPlayout::default();
+        p.push_video(vec![1], FRAME_SAMPLES as i64); // its sound is 60 ms behind
+        let (_, v) = p.next_frame();
+        assert_eq!(v.len(), 1, "due at the end of the first 60 ms");
+        p.push_audio(&[0; FRAME_SAMPLES * 10]);
+        p.push_video(vec![2], 0);
+        p.trim(FRAME_SAMPLES);
+        assert_eq!(p.buffered(), FRAME_SAMPLES);
+        let (_, v) = p.next_frame();
+        assert_eq!(v.len(), 1, "moved up with the trimmed sound");
+        let (_, v) = p.next_frame();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn synced_playout_timestamps_always_advance() {
+        let p = SyncedPlayout::default();
+        p.push_video(vec![1], 0);
+        p.push_video(vec![2], 0);
+        let (_, v) = p.next_frame();
+        assert_eq!(v.len(), 2);
+        assert!(v[1].0.wrapping_sub(v[0].0) == 1);
+    }
+
     use super::*;
 
     fn sine(freq: f64, rate: f64, n: usize) -> Vec<i16> {

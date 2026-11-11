@@ -179,9 +179,9 @@ config_schema:
     description: "Simli face ID: a preset from docs.simli.com/api-reference/preset-faces, or one you created in the Simli dashboard."
   avatar_video_delay_ms:
     type: int
-    default: 180
-    label: "Face lip-sync delay (ms)"
-    description: "Tavus full pipeline: how long the face's picture waits for its voice, so the lips match on the phone. Raise it if the voice trails the lips, lower it if the lips trail the voice."
+    default: 200
+    label: "Face lip-sync offset (ms)"
+    description: "Tavus full pipeline: how much later the face's voice reaches Hermes than its picture. The call sends each picture frame with its sound, shifted by this. Raise it if the voice trails the lips on the phone, lower it if the lips trail the voice."
   tavus_face_id:
     type: str
     default: "rccbeedfc684"

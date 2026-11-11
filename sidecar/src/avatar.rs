@@ -62,6 +62,9 @@ pub struct AvatarConfig {
     pub expressive: bool,
     /// The face holds the whole conversation, in its own voice (Tavus full pipeline).
     pub full: bool,
+    /// Full pipeline: how much later than its picture the face's sound reaches the sidecar
+    /// (negative: earlier), in ms. The call shifts the picture by this to match.
+    pub av_offset_ms: i32,
     /// Hard cap on one session, so a stuck call can never use up the account's minutes.
     pub max_session: Duration,
 }
@@ -99,6 +102,9 @@ pub enum AvatarEvent {
     },
     /// Full pipeline: the face ended the call.
     Hangup,
+    /// Full pipeline: one access unit of the face's picture. It travels with the sound so the
+    /// call can send it out in step with it (`SyncedPlayout`).
+    Video(Vec<u8>),
     Exited(String),
 }
 
@@ -129,6 +135,9 @@ pub struct Avatar {
     talking_until: Option<Instant>,
     pub expressive: bool,
     pub full: bool,
+    pub av_offset_ms: i32,
+    /// Where a full-pipeline face's picture goes into the call, once its sound goes out.
+    pub video_out: async_channel::Sender<TimedVideoFrame>,
 }
 
 /// The call's video: the bridge's access units with their capture timestamps.
@@ -185,7 +194,7 @@ impl Avatar {
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         let tasks = vec![
             tokio::spawn(write_bridge(stdin, msg_rx)),
-            tokio::spawn(read_bridge(stdout, video_tx, event_tx)),
+            tokio::spawn(read_bridge(stdout, video_tx.clone(), event_tx, cfg.full)),
         ];
         let avatar = Self {
             to_bridge: msg_tx,
@@ -197,6 +206,8 @@ impl Avatar {
             talking_until: None,
             expressive: cfg.expressive,
             full: cfg.full,
+            av_offset_ms: cfg.av_offset_ms,
+            video_out: video_tx,
         };
         Ok((avatar, AvatarVideo { timed: video_rx }))
     }
@@ -350,14 +361,14 @@ pub fn has_idr(au: &[u8]) -> bool {
 /// Passes access units on to the call, skipping from a keyframe boundary when the call is behind:
 /// one dropped frame would corrupt the picture until the next keyframe anyway.
 #[derive(Default)]
-struct VideoGate {
+pub struct VideoGate {
     started: bool,
     dropping: bool,
 }
 
 impl VideoGate {
     /// Whether to offer this AU to the call at all.
-    fn admit(&mut self, au: &[u8]) -> bool {
+    pub fn admit(&mut self, au: &[u8]) -> bool {
         let idr = has_idr(au);
         self.started |= idr;
         if self.dropping && idr {
@@ -366,8 +377,27 @@ impl VideoGate {
         self.started && !self.dropping
     }
 
-    fn full(&mut self) {
+    pub fn full(&mut self) {
         self.dropping = true;
+    }
+
+    /// Offers one access unit to the call.
+    pub fn offer(
+        &mut self,
+        video: &async_channel::Sender<TimedVideoFrame>,
+        au: Vec<u8>,
+        timestamp: u32,
+    ) {
+        if !self.admit(&au) {
+            return;
+        }
+        let frame = TimedVideoFrame::builder()
+            .data(au)
+            .timestamp(timestamp)
+            .build();
+        if let Err(async_channel::TrySendError::Full(_)) = video.try_send(frame) {
+            self.full();
+        }
     }
 }
 
@@ -375,6 +405,7 @@ async fn read_bridge(
     mut out: impl AsyncRead + Unpin,
     video: async_channel::Sender<TimedVideoFrame>,
     events: mpsc::UnboundedSender<AvatarEvent>,
+    video_with_sound: bool,
 ) {
     let mut gate = VideoGate::default();
     let why = loop {
@@ -389,18 +420,13 @@ async fn read_bridge(
             }
             OUT_VIDEO if payload.len() > 4 => {
                 let au = payload.split_off(4);
-                let timestamp =
-                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                if !gate.admit(&au) {
+                if video_with_sound {
+                    let _ = events.send(AvatarEvent::Video(au));
                     continue;
                 }
-                let frame = TimedVideoFrame::builder()
-                    .data(au)
-                    .timestamp(timestamp)
-                    .build();
-                if let Err(async_channel::TrySendError::Full(_)) = video.try_send(frame) {
-                    gate.full();
-                }
+                let timestamp =
+                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                gate.offer(&video, au, timestamp);
             }
             OUT_AUDIO => {
                 let _ = events.send(AvatarEvent::Audio(le_bytes_to_i16(&payload)));
@@ -497,7 +523,7 @@ mod tests {
 
         let (vtx, vrx) = async_channel::bounded(8);
         let (etx, mut erx) = mpsc::unbounded_channel();
-        read_bridge(wire.as_slice(), vtx, etx).await;
+        read_bridge(wire.as_slice(), vtx, etx, false).await;
 
         assert_eq!(erx.recv().await, Some(AvatarEvent::Ready));
         assert_eq!(erx.recv().await, Some(AvatarEvent::Audio(vec![1, -2, 3])));

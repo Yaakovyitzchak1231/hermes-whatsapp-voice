@@ -129,6 +129,9 @@ fn avatar_config(max_call: Duration, ring: Duration) -> Result<Option<AvatarConf
         key: (key.to_string(), required(key)?),
         expressive,
         full,
+        av_offset_ms: var("HWV_AVATAR_VIDEO_DELAY_MS", "200")
+            .parse()
+            .context("HWV_AVATAR_VIDEO_DELAY_MS must be a whole number of milliseconds")?,
         // The session starts at dialing, so it must outlast the ring and the longest call.
         max_session: max_call + ring + Duration::from_secs(60),
     }))

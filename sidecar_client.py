@@ -52,7 +52,7 @@ SETTINGS: dict[str, Any] = {
     "video_avatar": "off",
     "simli_face_id": "a36d66df-a23d-4569-996b-d0e990019857",
     "tavus_face_id": "rccbeedfc684",
-    "avatar_video_delay_ms": 180,
+    "avatar_video_delay_ms": 200,
     "video_calls": True,
     "avatar_python": "",
 }

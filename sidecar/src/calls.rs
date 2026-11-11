@@ -16,8 +16,8 @@ use whatsapp_rust::prelude::*;
 use whatsapp_rust::voip::{CallEvent, CallHandle, CallTermination, KeyframeUrgency};
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall};
 
-use crate::audio::{Downsampler, Playout, WavWriter};
-use crate::avatar::{Avatar, AvatarEvent, AvatarVideo, EMOTIONS};
+use crate::audio::{Downsampler, Playout, SyncedPlayout, WavWriter};
+use crate::avatar::{Avatar, AvatarEvent, AvatarVideo, EMOTIONS, VideoGate};
 use crate::config::Config;
 use crate::core::{self, Core};
 use crate::gemini::{Live, LiveEvent, Setup};
@@ -1018,15 +1018,23 @@ impl Bridge {
         });
         face.start();
         let answered = Instant::now();
-        let playout = Arc::new(Playout::default());
+        // The face's sound and picture leave together, on the sound's clock.
+        let playout = Arc::new(SyncedPlayout::default());
+        let av_offset = i64::from(face.av_offset_ms) * 16;
         let pacer = tokio::spawn({
-            let (playout, mic_tx) = (playout.clone(), mic_tx.clone());
+            let (playout, mic_tx, video) =
+                (playout.clone(), mic_tx.clone(), face.video_out.clone());
             async move {
+                let mut gate = VideoGate::default();
                 let mut tick = tokio::time::interval(FRAME_INTERVAL);
                 tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 loop {
                     tick.tick().await;
-                    if mic_tx.send(playout.next_frame()).await.is_err() {
+                    let (sound, picture) = playout.next_frame();
+                    for (timestamp, au) in picture {
+                        gate.offer(&video, au, timestamp);
+                    }
+                    if mic_tx.send(sound).await.is_err() {
                         break;
                     }
                 }
@@ -1073,9 +1081,10 @@ impl Bridge {
                         line.request_keyframe();
                     }
                     Some(AvatarEvent::Audio(pcm)) => {
-                        playout.push(&pcm);
+                        playout.push_audio(&pcm);
                         playout.trim(MAX_FACE_BACKLOG);
                     }
+                    Some(AvatarEvent::Video(au)) => playout.push_video(au, av_offset),
                     Some(AvatarEvent::Said { role, text }) => {
                         self.calls.update(id, |r| r.append(role, &format!("{text} ")));
                     }
@@ -1276,7 +1285,10 @@ impl Bridge {
                         live.send_image(&jpeg);
                     }
                     // Only a full-pipeline face sends these, and it never joins this loop.
-                    AvatarEvent::Said { .. } | AvatarEvent::ToolCall { .. } | AvatarEvent::Hangup => {}
+                    AvatarEvent::Said { .. }
+                    | AvatarEvent::ToolCall { .. }
+                    | AvatarEvent::Hangup
+                    | AvatarEvent::Video(_) => {}
                     AvatarEvent::Exited(why) => {
                         log::warn!("call {id}: avatar stopped ({why}); continuing with voice only");
                         avatar = None;

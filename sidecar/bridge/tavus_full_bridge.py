@@ -305,9 +305,8 @@ class Pal(EventHandler):
             self.stats["said"] += len(pcm)
 
     def send_loop(self):
-        """Lets each frame go `--video-delay-ms` after it was encoded. The face's speech reaches the
-        phone later than its picture (Daily hands the audio over later, and the call plays it out
-        in 60 ms frames), so the picture waits for it: measured 120 to 180 ms at the bridge."""
+        """Sends each frame `--video-delay-ms` after it was encoded (0 by default: the sidecar
+        lines the picture up with the voice, HWV_AVATAR_VIDEO_DELAY_MS, as it sends both)."""
         delay = self.args.video_delay_ms / 1000
         while True:
             item = self.outgoing.get()
@@ -494,8 +493,8 @@ def main():
     p.add_argument(
         "--video-delay-ms",
         type=int,
-        default=int(os.environ.get("HWV_AVATAR_VIDEO_DELAY_MS") or 180),
-        help="hold the picture back this long so the voice catches up (lip sync)",
+        default=0,
+        help="hold the picture back here (debug); the sidecar aligns picture and voice itself",
     )
     args = p.parse_args()
     if not args.serve:
