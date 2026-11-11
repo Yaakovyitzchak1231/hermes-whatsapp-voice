@@ -107,6 +107,13 @@ impl Playout {
         self.queue.lock().unwrap().clear();
     }
 
+    /// Keeps at most `max` samples, dropping the oldest, so speech can never pile up into delay.
+    pub fn trim(&self, max: usize) {
+        let mut q = self.queue.lock().unwrap();
+        let excess = q.len().saturating_sub(max);
+        q.drain(..excess);
+    }
+
     pub fn buffered(&self) -> usize {
         self.queue.lock().unwrap().len()
     }

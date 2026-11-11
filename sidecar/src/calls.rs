@@ -577,10 +577,15 @@ impl Bridge {
     }
 
     /// Starts the face for a video call, or says why the call stays voice-only.
-    fn start_avatar(&self, id: &str) -> Option<(Avatar, AvatarVideo)> {
+    fn start_avatar(&self, id: &str, info: &CallInfo) -> Option<(Avatar, AvatarVideo)> {
         let cfg = self.cfg.avatar.as_ref()?;
         match Avatar::spawn(cfg) {
-            Ok(face) => Some(face),
+            Ok((face, picture)) => {
+                if face.full {
+                    face.context(self.face_context(info));
+                }
+                Some((face, picture))
+            }
             Err(e) => {
                 log::warn!("call {id}: no video, the avatar did not start: {e:#}");
                 None
@@ -603,7 +608,12 @@ impl Bridge {
         let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(8);
         let (spk_tx, spk_rx) = async_channel::bounded::<Vec<i16>>(64);
         // The face starts while the phone rings: Simli takes several seconds to come up.
-        let face = if video { self.start_avatar(&id) } else { None };
+        let info = CallInfo::outbound(reason, details);
+        let face = if video {
+            self.start_avatar(&id, &info)
+        } else {
+            None
+        };
         self.ring_signals.start();
         let (voip, owner) = (client.voip(), self.owner_jid());
         let mut call = voip.call(&owner).audio(mic_rx, spk_tx);
@@ -634,7 +644,12 @@ impl Bridge {
             }
             return;
         };
-        let info = CallInfo::outbound(reason, details);
+        if let Some(face) = avatar.take_if(|f| f.full) {
+            log::info!("call {id}: video call, the face holds the conversation");
+            return self
+                .converse_face(&id, &handle, mic_tx, spk_rx, info, face)
+                .await;
+        }
         let (faces_tx, faces_rx) = mpsc::unbounded_channel();
         let had_face = avatar.is_some();
         if let Some(face) = avatar {
@@ -669,10 +684,12 @@ impl Bridge {
                 else {
                     continue;
                 };
-                if has_face || !state.is_upgrade_request() {
+                // A full-pipeline face cannot take over a conversation the voice model is holding.
+                let full = bridge.cfg.avatar.as_ref().is_some_and(|a| a.full);
+                if has_face || full || !state.is_upgrade_request() {
                     continue;
                 }
-                let Some((face, picture)) = bridge.start_avatar(&id) else {
+                let Some((face, picture)) = bridge.start_avatar(&id, &CallInfo::inbound()) else {
                     continue;
                 };
                 match handle.accept_video(token, picture, face.camera()).await {
@@ -704,7 +721,7 @@ impl Bridge {
         let (spk_tx, spk_rx) = async_channel::bounded::<Vec<i16>>(64);
         let video = matches!(call.action, CallAction::Offer { is_video: true, .. });
         let face = if video {
-            self.start_avatar(&record.id)
+            self.start_avatar(&record.id, &CallInfo::inbound())
         } else {
             None
         };
@@ -734,6 +751,18 @@ impl Bridge {
             handle.call_id(),
             if avatar.is_some() { " with video" } else { "" }
         );
+        if let Some(face) = avatar.take_if(|f| f.full) {
+            return self
+                .converse_face(
+                    &record.id,
+                    &handle,
+                    mic_tx,
+                    spk_rx,
+                    CallInfo::inbound(),
+                    face,
+                )
+                .await;
+        }
         let (faces_tx, faces_rx) = mpsc::unbounded_channel();
         let had_face = avatar.is_some();
         if let Some(face) = avatar {
@@ -848,7 +877,10 @@ impl Bridge {
 
     /// The face's emotion control, offered when the avatar can show emotions.
     fn expression_function(&self) -> Option<Value> {
-        self.cfg.avatar.as_ref().filter(|a| a.expressive)?;
+        self.cfg
+            .avatar
+            .as_ref()
+            .filter(|a| a.expressive && !a.full)?;
         Some(json!({
             "name": "set_expression",
             "description": "On a video call, change the emotion your face shows. Call it as your feelings \
@@ -952,6 +984,148 @@ impl Bridge {
             };
             let _ = done.send((tool_id, "ask_hermes".to_string(), result));
         })
+    }
+
+    /// What a full-pipeline face is told before the call: the voice model's own prompt, for a
+    /// video call, and why the call is happening.
+    fn face_context(&self, info: &CallInfo) -> String {
+        let prompt = self
+            .setup(&info.context)
+            .system_instruction
+            .replace("live WhatsApp voice call", "live WhatsApp video call");
+        json!({
+            "system_prompt": prompt,
+            "context": format!("{}\n{}", info.context, info.opening),
+        })
+        .to_string()
+    }
+
+    /// A video call where the face holds the conversation (Tavus full pipeline): the owner's voice
+    /// and camera go to it, its voice and picture come back together, and its ask_hermes calls run
+    /// on Hermes. If the face fails, the call carries on with the voice model.
+    pub(crate) async fn converse_face(
+        &self,
+        id: &str,
+        line: &impl Line,
+        mic_tx: async_channel::Sender<Vec<i16>>,
+        spk_rx: async_channel::Receiver<Vec<i16>>,
+        info: CallInfo,
+        mut face: Avatar,
+    ) {
+        self.calls.update(id, |r| {
+            r.status = Status::InProgress;
+            r.answered_at = Some(now());
+        });
+        face.start();
+        let answered = Instant::now();
+        let playout = Arc::new(Playout::default());
+        let pacer = tokio::spawn({
+            let (playout, mic_tx) = (playout.clone(), mic_tx.clone());
+            async move {
+                let mut tick = tokio::time::interval(FRAME_INTERVAL);
+                tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    if mic_tx.send(playout.next_frame()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<ToolDone>();
+        let mut tool_tasks: HashMap<String, JoinHandle<()>> = HashMap::new();
+        let mut live_at: Option<Instant> = None;
+        let mut check = tokio::time::interval(Duration::from_secs(2));
+        let face_timeout = tokio::time::sleep(FACE_START_TIMEOUT);
+        let max_duration = tokio::time::sleep(self.cfg.max_duration);
+        let ended = line.ended();
+        tokio::pin!(face_timeout, max_duration, ended);
+
+        let outcome: Result<(String, &'static str), String> = loop {
+            tokio::select! {
+                _ = &mut ended => break Ok(("call ended".to_string(), "phone")),
+                _ = &mut max_duration => break Ok(("maximum call length reached".to_string(), "limit")),
+                _ = &mut face_timeout, if live_at.is_none() => {
+                    break Err("the face did not come up in time".to_string());
+                }
+                frame = spk_rx.recv() => match frame {
+                    Ok(f) => face.hear(f),
+                    Err(_) => break Ok(("call audio closed".to_string(), "phone")),
+                },
+                Some((tool_id, name, result)) = tool_rx.recv() => {
+                    tool_tasks.remove(&tool_id);
+                    log::info!("call {id}: {name} answered");
+                    face.tool_result(&tool_id, &result_text(&result), result.get("error").is_none());
+                }
+                _ = check.tick() => {
+                    // The face can only see the owner from a keyframe on; ask while it starts.
+                    if live_at.is_some_and(|t| t.elapsed() < CAMERA_WARMUP) {
+                        line.request_keyframe();
+                    }
+                }
+                ev = face.events.recv() => match ev {
+                    Some(AvatarEvent::Ready) => {
+                        log::info!(
+                            "call {id}: the face is live {:.2}s after answer",
+                            answered.elapsed().as_secs_f32()
+                        );
+                        live_at = Some(Instant::now());
+                        line.request_keyframe();
+                    }
+                    Some(AvatarEvent::Audio(pcm)) => {
+                        playout.push(&pcm);
+                        playout.trim(MAX_FACE_BACKLOG);
+                    }
+                    Some(AvatarEvent::Said { role, text }) => {
+                        self.calls.update(id, |r| r.append(role, &format!("{text} ")));
+                    }
+                    Some(AvatarEvent::ToolCall { id: tool_id, name, args }) => {
+                        if name == "ask_hermes" {
+                            log::info!("call {id}: ask_hermes {}", args["request"]);
+                            let task = self.spawn_ask_hermes(&tool_id, id, &args, tool_tx.clone());
+                            tool_tasks.insert(tool_id, task);
+                        } else {
+                            face.tool_result(&tool_id, "unknown tool", false);
+                        }
+                    }
+                    Some(AvatarEvent::Hangup) => break Ok(("assistant ended the call".to_string(), "assistant")),
+                    Some(AvatarEvent::Snapshot(_)) => {}
+                    Some(AvatarEvent::Exited(why)) => break Err(why),
+                    None => break Err("the avatar bridge stopped".to_string()),
+                },
+            }
+        };
+        tool_tasks.values().for_each(JoinHandle::abort);
+        let (end_reason, ended_by) = match outcome {
+            Ok(end) => end,
+            Err(why) => {
+                pacer.abort();
+                log::warn!("call {id}: {why}; carrying on with the voice model");
+                face.finish().await;
+                let (_, no_faces) = mpsc::unbounded_channel();
+                return self
+                    .converse(id, line, mic_tx, spk_rx, info, no_faces)
+                    .await;
+            }
+        };
+        if ended_by == "assistant" {
+            // Let the goodbye finish playing before hanging up.
+            let until = Instant::now() + Duration::from_secs(5);
+            while playout.buffered() > 0 && Instant::now() < until {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            tokio::time::sleep(self.cfg.hangup_grace).await;
+        }
+        pacer.abort();
+        face.finish().await;
+        if ended_by != "phone" {
+            line.hang_up().await;
+        }
+        log::info!("call {id}: {end_reason} (the face held the conversation)");
+        self.calls.update(id, |r| r.metrics.ended_by = ended_by);
+        self.calls.finish(id, Status::Completed, end_reason);
+        self.send_summary(id).await;
+        self.refresh_persona().await;
     }
 
     pub(crate) async fn converse(
@@ -1417,6 +1591,13 @@ const VIDEO_NOTE: &str = "(This is now a video call. The owner sees your face, a
     person would, without describing every frame. Show your feelings with set_expression as you talk.)";
 /// How long the owner's camera may stay without a snapshot before asking for a keyframe.
 const CAMERA_STALE: Duration = Duration::from_secs(4);
+/// A full-pipeline face that is not live by then gives the call to the voice model.
+const FACE_START_TIMEOUT: Duration = Duration::from_secs(20);
+/// While a full-pipeline face starts, keep asking for the owner's camera keyframes this long.
+const CAMERA_WARMUP: Duration = Duration::from_secs(8);
+/// The face's speech waiting to play is capped here (16 kHz samples, 0.4 s): a backlog would
+/// put the voice behind the lips.
+const MAX_FACE_BACKLOG: usize = 6_400;
 
 fn end_call_function() -> Value {
     json!({

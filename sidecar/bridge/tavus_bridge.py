@@ -11,7 +11,8 @@ PROTOCOL (every message: 1-byte type, 4-byte little-endian payload length, paylo
                       0x03 end      stop and exit
                       0x04 emotion  UTF-8 name: neutral, happiness, sadness, anger, fear,
                                     surprise, disgust or contempt ("" clears it)
-                      0x05 camera   one Annex-B H.264 access unit of the owner's camera
+                      0x05 camera   1 orientation byte, then one Annex-B H.264 access unit of the
+                                    owner's camera
   bridge -> sidecar   0x10 ready    the face is live
                       0x11 video    4-byte LE 90 kHz RTP timestamp, then one Annex-B access unit
                       0x12 audio    PCM16 LE mono 16 kHz, lip-synced with the video
@@ -419,8 +420,8 @@ def serve(args):
                 emotion = payload.decode("utf-8", "replace").strip().lower()
                 if emotion in EMOTIONS:
                     face.send("conversation.set_emotion", {"emotion": emotion})
-            elif kind == MSG_CAMERA:
-                camera.push(payload)
+            elif kind == MSG_CAMERA and len(payload) > 1:
+                camera.push(payload[1:])
             elif kind == MSG_END:
                 break
     finally:

@@ -51,7 +51,7 @@ SETTINGS: dict[str, Any] = {
     "send_summary": True,
     "video_avatar": "off",
     "simli_face_id": "a36d66df-a23d-4569-996b-d0e990019857",
-    "tavus_face_id": "r3f4182ef554",
+    "tavus_face_id": "rccbeedfc684",
     "video_calls": True,
     "avatar_python": "",
 }
@@ -157,8 +157,8 @@ def gemini_key() -> str:
 
 
 def avatar_provider(s: dict[str, Any]) -> str:
-    """The avatar provider whose bridge script runs: tavus, or simli (also when video is off)."""
-    return "tavus" if s["video_avatar"] == "tavus" else "simli"
+    """The bridge script that runs: tavus_full (tavus), tavus (tavus-echo), or simli (also when off)."""
+    return {"tavus": "tavus_full", "tavus-echo": "tavus"}.get(str(s["video_avatar"]), "simli")
 
 
 def avatar_python(s: dict[str, Any]) -> str:

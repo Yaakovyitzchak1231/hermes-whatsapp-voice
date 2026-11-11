@@ -115,11 +115,12 @@ fn live_config(raw: &str) -> Result<serde_json::Value> {
 /// The avatar bridge settings, when video calls are on.
 fn avatar_config(max_call: Duration, ring: Duration) -> Result<Option<AvatarConfig>> {
     let provider = var("HWV_VIDEO_AVATAR", "off");
-    let (face, key, expressive) = match provider.as_str() {
+    let (face, key, expressive, full) = match provider.as_str() {
         "off" => return Ok(None),
-        "simli" => ("HWV_SIMLI_FACE_ID", "SIMLI_API_KEY", false),
-        "tavus" => ("HWV_TAVUS_FACE_ID", "TAVUS_API_KEY", true),
-        other => bail!("HWV_VIDEO_AVATAR must be off, simli or tavus, got {other:?}"),
+        "simli" => ("HWV_SIMLI_FACE_ID", "SIMLI_API_KEY", false, false),
+        "tavus" => ("HWV_TAVUS_FACE_ID", "TAVUS_API_KEY", true, true),
+        "tavus-echo" => ("HWV_TAVUS_FACE_ID", "TAVUS_API_KEY", true, false),
+        other => bail!("HWV_VIDEO_AVATAR must be off, simli, tavus or tavus-echo, got {other:?}"),
     };
     Ok(Some(AvatarConfig {
         python: var("HWV_AVATAR_PYTHON", "python3"),
@@ -127,6 +128,7 @@ fn avatar_config(max_call: Duration, ring: Duration) -> Result<Option<AvatarConf
         face_id: required(face)?,
         key: (key.to_string(), required(key)?),
         expressive,
+        full,
         // The session starts at dialing, so it must outlast the ring and the longest call.
         max_session: max_call + ring + Duration::from_secs(60),
     }))

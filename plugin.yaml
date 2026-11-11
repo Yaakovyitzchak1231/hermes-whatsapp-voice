@@ -169,9 +169,9 @@ config_schema:
   video_avatar:
     type: str
     default: "off"
-    choices: ["off", "simli", "tavus"]
+    choices: ["off", "tavus", "tavus-echo", "simli"]
     label: "Video avatar"
-    description: "tavus: video calls show an expressive face (Tavus) that reacts as it speaks and sees your camera. Needs TAVUS_API_KEY. simli: a lip-synced face (Simli). Needs SIMLI_API_KEY. Both need `hermes whatsapp-voice avatar-setup`. off: voice calls only."
+    description: "tavus: on video calls a Tavus face holds the conversation in its own voice: it listens, sees your camera and reacts, and asks Hermes for anything it needs. tavus-echo: the Tavus face speaks the Gemini voice instead (no listening). Both need TAVUS_API_KEY. simli: a lip-synced face (Simli), needs SIMLI_API_KEY. All need `hermes whatsapp-voice avatar-setup`. off: voice calls only."
   simli_face_id:
     type: str
     default: "a36d66df-a23d-4569-996b-d0e990019857"
@@ -179,7 +179,7 @@ config_schema:
     description: "Simli face ID: a preset from docs.simli.com/api-reference/preset-faces, or one you created in the Simli dashboard."
   tavus_face_id:
     type: str
-    default: "r3f4182ef554"
+    default: "rccbeedfc684"
     label: "Tavus face"
     description: "Tavus replica ID for video_avatar tavus: a stock face from docs.tavus.io/sections/replica/stock-replicas, or your own."
   video_calls:

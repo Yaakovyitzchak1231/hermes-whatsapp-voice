@@ -1,7 +1,9 @@
 //! The face of a video call: a bridge process (`sidecar/bridge/simli_bridge.py` or
 //! `tavus_bridge.py`) turns the voice model's speech into a lip-synced talking face. The Tavus
 //! face is expressive: it takes emotion cues, and it hands back snapshots of the owner's camera
-//! so the voice model can see them. It hands back H.264 access units for the
+//! so the voice model can see them. A full-pipeline Tavus face (`tavus_full_bridge.py`) goes
+//! further and holds the conversation itself: it hears the owner, sees their camera and answers
+//! in its own voice, handing tool calls back here for Hermes. It hands back H.264 access units for the
 //! call's video and its own copy of the speech, which the call plays instead of the raw model audio
 //! so lips and voice stay together.
 //!
@@ -27,10 +29,16 @@ const MSG_CLEAR: u8 = 0x02;
 const MSG_END: u8 = 0x03;
 const MSG_EMOTION: u8 = 0x04;
 const MSG_CAMERA: u8 = 0x05;
+const MSG_CONTEXT: u8 = 0x06;
+const MSG_RESULT: u8 = 0x07;
+const MSG_START: u8 = 0x08;
 const OUT_READY: u8 = 0x10;
 const OUT_VIDEO: u8 = 0x11;
 const OUT_AUDIO: u8 = 0x12;
 const OUT_SNAPSHOT: u8 = 0x13;
+const OUT_SAID: u8 = 0x14;
+const OUT_TOOL: u8 = 0x15;
+const OUT_HANGUP: u8 = 0x16;
 /// Largest message the bridge may send; a keyframe at its bitrate cap is far smaller.
 const MAX_MESSAGE: usize = 4 << 20;
 /// Access units waiting for the call. When the call falls behind, frames are skipped from a
@@ -52,6 +60,8 @@ pub struct AvatarConfig {
     pub key: (String, String),
     /// The face shows emotions on cue and watches the owner's camera (Tavus).
     pub expressive: bool,
+    /// The face holds the whole conversation, in its own voice (Tavus full pipeline).
+    pub full: bool,
     /// Hard cap on one session, so a stuck call can never use up the account's minutes.
     pub max_session: Duration,
 }
@@ -76,6 +86,19 @@ pub enum AvatarEvent {
     Audio(Vec<i16>),
     /// A JPEG of the owner's camera, about once a second.
     Snapshot(Vec<u8>),
+    /// Full pipeline: something said on the call, by "owner" or "assistant".
+    Said {
+        role: &'static str,
+        text: String,
+    },
+    /// Full pipeline: the face wants a tool run.
+    ToolCall {
+        id: String,
+        name: String,
+        args: serde_json::Value,
+    },
+    /// Full pipeline: the face ended the call.
+    Hangup,
     Exited(String),
 }
 
@@ -86,6 +109,9 @@ enum Msg {
     End,
     Emotion(String),
     Camera(Vec<u8>),
+    Context(String),
+    Start,
+    ToolResult(String),
 }
 
 /// A running bridge for one call.
@@ -102,6 +128,7 @@ pub struct Avatar {
     /// When the speech already handed to the face finishes playing back.
     talking_until: Option<Instant>,
     pub expressive: bool,
+    pub full: bool,
 }
 
 /// The call's video: the bridge's access units with their capture timestamps.
@@ -169,6 +196,7 @@ impl Avatar {
             speaking: false,
             talking_until: None,
             expressive: cfg.expressive,
+            full: cfg.full,
         };
         Ok((avatar, AvatarVideo { timed: video_rx }))
     }
@@ -189,10 +217,33 @@ impl Avatar {
         }
     }
 
+    /// Full pipeline: what the face needs to know before the call (JSON with `system_prompt` and
+    /// `context`). The face is created from it while the phone rings.
+    pub fn context(&self, json: String) {
+        let _ = self.to_bridge.send(Msg::Context(json));
+    }
+
+    /// Full pipeline: the owner answered, so the face joins and says hello.
+    pub fn start(&self) {
+        let _ = self.to_bridge.send(Msg::Start);
+    }
+
+    /// Full pipeline: the owner's speech (16 kHz mono) for the face to hear.
+    pub fn hear(&self, pcm: Vec<i16>) {
+        let _ = self.to_bridge.send(Msg::Audio(pcm));
+    }
+
+    /// Full pipeline: the result of a tool the face asked for.
+    pub fn tool_result(&self, id: &str, output: &str, ok: bool) {
+        let status = if ok { "success" } else { "error" };
+        let json = serde_json::json!({"id": id, "output": output, "status": status});
+        let _ = self.to_bridge.send(Msg::ToolResult(json.to_string()));
+    }
+
     /// Where the call delivers the owner's camera. An expressive face gets every access unit
     /// from the first keyframe on, and sends back snapshots the voice model can look at.
     pub fn camera(&self) -> async_channel::Sender<VideoFrame> {
-        if !self.expressive {
+        if !self.expressive && !self.full {
             return discard_peer_video();
         }
         let (tx, rx) = async_channel::bounded::<VideoFrame>(16);
@@ -201,7 +252,14 @@ impl Avatar {
             let mut started = false;
             while let Ok(frame) = rx.recv().await {
                 started |= frame.keyframe;
-                if started && to_bridge.send(Msg::Camera(frame.data)).is_err() {
+                if !started {
+                    continue;
+                }
+                // The phone sends its camera as captured; the orientation says how to turn it.
+                let mut payload = Vec::with_capacity(frame.data.len() + 1);
+                payload.push(frame.orientation & 3);
+                payload.extend_from_slice(&frame.data);
+                if to_bridge.send(Msg::Camera(payload)).is_err() {
                     break;
                 }
             }
@@ -269,6 +327,9 @@ async fn write_bridge(mut w: impl AsyncWrite + Unpin, mut rx: mpsc::UnboundedRec
             Msg::End => (MSG_END, Vec::new()),
             Msg::Emotion(e) => (MSG_EMOTION, e.into_bytes()),
             Msg::Camera(au) => (MSG_CAMERA, au),
+            Msg::Context(json) => (MSG_CONTEXT, json.into_bytes()),
+            Msg::Start => (MSG_START, Vec::new()),
+            Msg::ToolResult(json) => (MSG_RESULT, json.into_bytes()),
         };
         if w.write_all(&encode(kind, &payload)).await.is_err() || w.flush().await.is_err() {
             return;
@@ -347,10 +408,43 @@ async fn read_bridge(
             OUT_SNAPSHOT if payload.starts_with(&[0xff, 0xd8]) => {
                 let _ = events.send(AvatarEvent::Snapshot(payload));
             }
+            OUT_SAID => {
+                if let Some(said) = parse_said(&payload) {
+                    let _ = events.send(said);
+                }
+            }
+            OUT_TOOL => {
+                if let Ok(call) = serde_json::from_slice::<serde_json::Value>(&payload)
+                    && let (Some(id), Some(name)) = (call["id"].as_str(), call["name"].as_str())
+                {
+                    let _ = events.send(AvatarEvent::ToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        args: call["args"].clone(),
+                    });
+                }
+            }
+            OUT_HANGUP => {
+                let _ = events.send(AvatarEvent::Hangup);
+            }
             _ => {}
         }
     };
     let _ = events.send(AvatarEvent::Exited(why));
+}
+
+fn parse_said(payload: &[u8]) -> Option<AvatarEvent> {
+    let said: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let role = match said["role"].as_str()? {
+        "owner" => "owner",
+        "assistant" => "assistant",
+        _ => return None,
+    };
+    let text = said["text"].as_str()?.trim();
+    (!text.is_empty()).then(|| AvatarEvent::Said {
+        role,
+        text: text.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -393,6 +487,13 @@ mod tests {
         wire.extend(encode(OUT_AUDIO, &i16_to_le_bytes(&[1, -2, 3])));
         wire.extend(encode(OUT_SNAPSHOT, b"not a jpeg"));
         wire.extend(encode(OUT_SNAPSHOT, &[0xff, 0xd8, 0xff, 0xd9]));
+        wire.extend(encode(OUT_SAID, br#"{"role":"owner","text":" hi there "}"#));
+        wire.extend(encode(OUT_SAID, br#"{"role":"someone","text":"no"}"#));
+        wire.extend(encode(
+            OUT_TOOL,
+            br#"{"id":"c1","name":"ask_hermes","args":{"request":"weather"}}"#,
+        ));
+        wire.extend(encode(OUT_HANGUP, &[]));
 
         let (vtx, vrx) = async_channel::bounded(8);
         let (etx, mut erx) = mpsc::unbounded_channel();
@@ -405,6 +506,23 @@ mod tests {
             Some(AvatarEvent::Snapshot(vec![0xff, 0xd8, 0xff, 0xd9])),
             "only JPEG snapshots pass"
         );
+        assert_eq!(
+            erx.recv().await,
+            Some(AvatarEvent::Said {
+                role: "owner",
+                text: "hi there".into()
+            }),
+            "unknown roles are dropped"
+        );
+        assert_eq!(
+            erx.recv().await,
+            Some(AvatarEvent::ToolCall {
+                id: "c1".into(),
+                name: "ask_hermes".into(),
+                args: serde_json::json!({"request": "weather"}),
+            })
+        );
+        assert_eq!(erx.recv().await, Some(AvatarEvent::Hangup));
         assert!(matches!(erx.recv().await, Some(AvatarEvent::Exited(_))));
         // The P frame came before any keyframe, so only the IDR reaches the call.
         let frame = vrx.recv().await.unwrap();
@@ -419,6 +537,9 @@ mod tests {
         tx.send(Msg::Clear).unwrap();
         tx.send(Msg::Emotion("happiness".into())).unwrap();
         tx.send(Msg::Camera(vec![0, 0, 0, 1, 0x65])).unwrap();
+        tx.send(Msg::Context("{}".into())).unwrap();
+        tx.send(Msg::Start).unwrap();
+        tx.send(Msg::ToolResult("{}".into())).unwrap();
         tx.send(Msg::End).unwrap();
         let mut wire = Vec::new();
         write_bridge(&mut wire, rx).await;
@@ -439,6 +560,10 @@ mod tests {
             read_message(&mut r).await.unwrap(),
             Some((MSG_CAMERA, vec![0, 0, 0, 1, 0x65]))
         );
+        for kind in [MSG_CONTEXT, MSG_START, MSG_RESULT] {
+            let (k, _) = read_message(&mut r).await.unwrap().unwrap();
+            assert_eq!(k, kind);
+        }
         assert_eq!(read_message(&mut r).await.unwrap(), Some((MSG_END, vec![])));
         assert_eq!(read_message(&mut r).await.unwrap(), None);
     }
