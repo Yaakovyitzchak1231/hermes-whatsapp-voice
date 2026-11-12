@@ -59,7 +59,8 @@ CAMERA_W, CAMERA_H, CAMERA_FPS = 480, 640, 10
 SPEECH_NOTE = (
     "\n\nTHIS OVERRIDES ANY STYLE NOTE ABOVE: every character you write is read aloud by a speech "
     "voice, so never write stage directions, sound effects or anything between asterisks (no *sigh*, "
-    "*sniffle*, *cough*). Show sighs, groans and moods with your face and with spoken words like "
+    "*sniffle*, *cough*), and never write the names of sounds as words either (no 'sniffle', 'sigh', "
+    "'cough', 'ahem', 'clears throat'). Show sighs, groans and moods with your face and with spoken words like "
     "'ugh', 'hmm' or 'oh man' instead. You can see the owner through their camera; react to what you "
     "see when it matters, the way a person on a video call would.\n\nYour face shows what you feel, so "
     "feel it big: grin when you joke or tease, look exasperated when you complain, light up with "
@@ -376,6 +377,7 @@ class Pal(EventHandler):
     # ---- the owner, into the room
 
     def hear(self, pcm):
+        self.dump.heard(pcm)
         self.mic.write_frames(pcm)
         self.stats["heard"] += len(pcm)
 
@@ -403,6 +405,7 @@ class Dump:
         self.h264 = open(os.path.join(folder, "face.h264"), "wb")  # noqa: SIM115 - closed in close()
         self.pcm = open(os.path.join(folder, "face_audio.pcm"), "wb")  # noqa: SIM115
         self.times = open(os.path.join(folder, "face_times.jsonl"), "w")  # noqa: SIM115
+        self.owner = open(os.path.join(folder, "owner_audio.pcm"), "wb")  # noqa: SIM115
         self.lock = threading.Lock()
 
     def _mark(self, kind, n):
@@ -420,10 +423,16 @@ class Dump:
                 self.pcm.write(pcm)
                 self._mark("a", len(pcm))
 
+    def heard(self, pcm):
+        if self.on:
+            with self.lock:
+                self.owner.write(pcm)
+                self._mark("o", len(pcm))
+
     def close(self):
         if self.on:
             with self.lock:
-                for f in (self.h264, self.pcm, self.times):
+                for f in (self.h264, self.pcm, self.times, self.owner):
                     f.close()
                 self.on = False
 
