@@ -64,8 +64,7 @@ SPEECH_NOTE = (
     "see when it matters, the way a person on a video call would.\n\nYour face shows what you feel, so "
     "feel it big: grin when you joke or tease, look exasperated when you complain, light up with "
     "surprise at news, soften with warmth when the owner is kind or tired. Change your mood often, "
-    "like a lively person would; a flat, neutral face looks like a robot.\n\nKeep each reply to one or "
-    "two short sentences, then let the owner talk. Answer right away; never wind up to a point."
+    "like a lively person would; a flat, neutral face looks like a robot."
 )
 ASK_HERMES = {
     "name": "ask_hermes",
